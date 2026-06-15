@@ -1,0 +1,16 @@
+.{
+    .name = .yaan_example_app,
+    .version = "0.0.0",
+    .fingerprint = 0x1d6d9bd0680e7b38,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .yaan = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "static",
+    },
+}

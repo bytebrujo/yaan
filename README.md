@@ -574,5 +574,70 @@ image processing. The original `filename` is never used as a server filesystem
 path. Request bodies are capped at 8 MiB by default; oversized uploads return
 `413 Payload Too Large`.
 
+By default the dev server runs app code as separately-compiled runner
+executables — `.yaan/hook_runner`, `.yaan/load_runner`, `.yaan/action_runner`,
+and `.yaan/remote_runner` — invoked per request over JSON. This keeps the
+generic `yaan` binary free of app code.
+
+Yaan can also run the whole request path in-process: the app's hooks, loaders,
+actions, and remotes are linked into a single server binary, and no runner
+subprocess is spawned. This is an opt-in build, not a separate runtime — the
+same handlers, the same generated `.yaan/*` runtime, and the same
+`routes.Result(T)`/`hooks.Decision` types.
+
+The wiring is a framework build helper. Consume Yaan as a dependency in
+`build.zig.zon`:
+
+```zig
+.{
+    .name = .my_app,
+    .version = "0.0.0",
+    .fingerprint = 0x..., // zig prints the value to use on first build
+    .dependencies = .{
+        .yaan = .{ .path = "../path/to/yaan" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+```
+
+Then a single call in `build.zig` builds the in-process server:
+
+```zig
+const yaan = @import("yaan");
+
+const yaan_dep = b.dependency("yaan", .{ .target = target, .optimize = optimize });
+
+// app_build_cmd runs `yaan build`, generating dist/ and .yaan/*.
+const app_server = yaan.addInProcessServer(b, .{
+    .target = target,
+    .optimize = optimize,
+    .yaan_dep = yaan_dep,
+    .app_build_step = &app_build_cmd.step,
+});
+
+const dev_inproc = b.step("dev-inproc", "Run the in-process server");
+dev_inproc.dependOn(&b.addRunArtifact(app_server).step);
+```
+
+`addInProcessServer` discovers every `+load.zig`, `+actions.zig`, and
+`*.remote.zig` under `src/` and wires their module graph — no hardcoded route
+list. `examples/app/build.zig` is a copyable reference. Run it with:
+
+```sh
+zig build dev-inproc
+```
+
+Internally the server exposes per-stage seams (`hook`, `load`, `action`,
+`remote`) as function pointers on its options; the in-process build points them
+at the linked handlers, and leaving a seam unset falls back to the runner
+subprocess. Hooks compose through a comptime-composed, Tower-style layer
+pipeline (`src/pipeline.zig`) with explicit tagged short-circuit, a threaded
+request context with a response builder, and per-route guards. The whole path
+stays request-in/response-out, so it remains drivable in tests without a socket.
+
+The subprocess model (`zig build dev`) remains the default and is unchanged; the
+in-process build is the path toward linking user code directly into the server
+and retiring the per-request runner processes.
+
 Static `yaan build` output is still plain browser assets. If served without the
 Yaan dev server, load endpoint requests fall back to route params in the client.

@@ -13,6 +13,7 @@ zig build -Dapp-root=examples/app app-build
 zig build -Dapp-root=examples/app dev --watch -fincremental
 zig build -Dapp-root=examples/app -Dotel-endpoint=http://127.0.0.1:4318/v1/traces dev
 cd examples/app && zig build test
+cd examples/app && zig build dev-inproc   # in-process server: handlers linked in, no runner subprocesses
 ```
 
 V1 is intentionally small: browser SPA output only, opaque JavaScript in

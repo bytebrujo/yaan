@@ -1,0 +1,14 @@
+.{
+    .name = .yaan,
+    .version = "0.1.0",
+    .fingerprint = 0xa88a87a424e31d47,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}

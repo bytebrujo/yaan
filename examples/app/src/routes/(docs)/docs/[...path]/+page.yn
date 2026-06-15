@@ -1,0 +1,6 @@
+<script>
+const title = props.params.path ? `Docs: ${props.params.path}` : "Docs";
+</script>
+
+<h1>{title}</h1>
+<p>Route group metadata keeps this page under the docs group without changing the URL.</p>

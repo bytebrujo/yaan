@@ -1,0 +1,26 @@
+<script>
+import { greeting } from '/remotes.js';
+import { PUBLIC_SITE_NAME } from '/env.public.js';
+
+const count = $signal(0);
+const items = $signal([{ id: 1, name: "one" }, { id: 2, name: "two" }]);
+const hello = $resource(() => greeting({ name: PUBLIC_SITE_NAME }));
+</script>
+
+<style>
+main > button { color: white; background: #1f6feb; }
+:global(body) { font-family: system-ui, sans-serif; }
+</style>
+
+<main>
+  <img src={asset("logo.svg")} alt="Yaan mark" width="64" height="64" />
+  <h1>{PUBLIC_SITE_NAME}</h1>
+  {#if hello.ready()}<p>{hello.value().message}</p>{:else}<p>Loading remote.</p>{/if}
+  <button on:click={() => count.update(n => n + 1)}>Count {count.read()}</button>
+  {#if count.read() > 2}<p>Reactive enough.</p>{:else}<p>Click the button.</p>{/if}
+  {#each items.read() as item (item.id)}<p>{item.name}</p>{/each}
+  <a href="/blog/hello">String route</a>
+  <a href="/docs/intro/setup">Docs catchall</a>
+  <a href="/users/42">Int route</a>
+  <a href="/login">Form action</a>
+</main>

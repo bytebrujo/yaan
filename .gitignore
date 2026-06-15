@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+dist/
+.yaan/
+
+# Local tooling / editor artifacts
+.DS_Store
+.agents/
+.claude/
+skills-lock.json

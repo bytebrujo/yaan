@@ -1,0 +1,5 @@
+<script>
+const id = $memo(() => props.data.id);
+</script>
+
+<h1>User {id.read()}</h1>

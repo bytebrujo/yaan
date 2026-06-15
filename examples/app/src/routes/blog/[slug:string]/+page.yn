@@ -1,0 +1,5 @@
+<script>
+const title = $memo(() => props.data.title);
+</script>
+
+<h1>{title.read()}</h1>

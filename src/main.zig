@@ -1,0 +1,118 @@
+const std = @import("std");
+const yaan = @import("yaan");
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
+    if (args.len < 2) return usage();
+
+    const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "init")) {
+        try yaan.project.writeExampleApp(init.io, allocator);
+        std.debug.print("created example src/routes app\n", .{});
+    } else if (std.mem.eql(u8, cmd, "check")) {
+        try runCheck(init.io, allocator);
+    } else if (std.mem.eql(u8, cmd, "build")) {
+        const out = optionValue(args, "--out") orelse "dist";
+        try yaan.project.buildProject(init.io, allocator, out);
+        std.debug.print("built {s}\n", .{out});
+    } else if (std.mem.eql(u8, cmd, "dev")) {
+        const host = optionValue(args, "--host") orelse "127.0.0.1";
+        const port_text = optionValue(args, "--port") orelse "5173";
+        const port = try std.fmt.parseInt(u16, port_text, 10);
+        const otel_endpoint = optionValue(args, "--otel-endpoint");
+        const service_name = optionValue(args, "--otel-service") orelse "yaan-dev";
+        const prod_errors = optionFlag(args, "--prod-errors");
+        const trusted_proxies = try optionList(allocator, args, "--trusted-proxy");
+        const force_https = optionFlag(args, "--force-https");
+        const hsts = optionFlag(args, "--hsts");
+        const hsts_max_age_text = optionValue(args, "--hsts-max-age") orelse "31536000";
+        const hsts_max_age = try std.fmt.parseInt(u32, hsts_max_age_text, 10);
+        try yaan.project.buildProject(init.io, allocator, "dist");
+        try yaan.project.buildDevLoadRunner(init.io, allocator);
+        try yaan.project.buildDevActionRunner(init.io, allocator);
+        try yaan.project.buildDevRemoteRunner(init.io, allocator);
+        try yaan.project.buildDevHookRunner(init.io, allocator);
+        try yaan.server.serve(init.io, allocator, .{
+            .host = host,
+            .port = port,
+            .root = "dist",
+            .observability = .{
+                .enabled = otel_endpoint != null,
+                .endpoint = otel_endpoint orelse "http://127.0.0.1:4318/v1/traces",
+                .service_name = service_name,
+            },
+            .debug_errors = !prod_errors,
+            .trusted_proxies = trusted_proxies,
+            .force_https = force_https,
+            .hsts = hsts,
+            .hsts_max_age = hsts_max_age,
+        });
+    } else {
+        return usage();
+    }
+}
+
+fn runCheck(io: std.Io, allocator: std.mem.Allocator) !void {
+    const failures = yaan.project.checkProject(io, allocator) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("no src/routes directory found\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    if (failures > 0) return error.CheckFailed;
+    std.debug.print("yaan check passed\n", .{});
+}
+
+fn optionValue(args: []const []const u8, name: []const u8) ?[]const u8 {
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, name) and i + 1 < args.len) return args[i + 1];
+    }
+    return null;
+}
+
+fn optionFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, name)) return true;
+    }
+    return false;
+}
+
+fn optionList(allocator: std.mem.Allocator, args: []const []const u8, name: []const u8) ![]const []const u8 {
+    const raw = optionValue(args, name) orelse return &.{};
+    var items: std.ArrayList([]const u8) = .empty;
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) try items.append(allocator, trimmed);
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+fn usage() void {
+    std.debug.print(
+        \\usage: yaan <command>
+        \\
+        \\commands:
+        \\  init
+        \\  check
+        \\  build [--out dist]
+        \\  dev [--host 127.0.0.1] [--port 5173] [--otel-endpoint http://127.0.0.1:4318/v1/traces] [--otel-service yaan-dev] [--prod-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--hsts-max-age 31536000]
+        \\
+    , .{});
+}
+
+test "option parser" {
+    const args = [_][]const u8{ "yaan", "dev", "--port", "9000" };
+    try std.testing.expectEqualStrings("9000", optionValue(&args, "--port").?);
+}
+
+test "option list parser" {
+    const args = [_][]const u8{ "yaan", "dev", "--trusted-proxy", "127.0.0.1, ::1" };
+    const values = try optionList(std.testing.allocator, &args, "--trusted-proxy");
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expectEqualStrings("127.0.0.1", values[0]);
+    try std.testing.expectEqualStrings("::1", values[1]);
+}

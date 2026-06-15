@@ -1,0 +1,21 @@
+<script>
+const message = $memo(() => props.form?.message ?? "Sign in");
+const snapshot = {
+  capture() {
+    const form = document.querySelector("form");
+    return form ? { email: form.email.value } : null;
+  },
+  restore(value) {
+    const form = document.querySelector("form");
+    if (form && value?.email) form.email.value = value.email;
+  },
+};
+</script>
+
+<form method="POST" enctype="multipart/form-data">
+  <label>Email <input name="email" value="person@example.com" /></label>
+  <label>Password <input name="password" type="password" value="secret" /></label>
+  <label>Avatar <input name="avatar" type="file" /></label>
+  <button>Submit</button>
+</form>
+<p>{message.read()}</p>

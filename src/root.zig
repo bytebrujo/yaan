@@ -8,6 +8,7 @@ pub const server = @import("server.zig");
 pub const observability = @import("observability.zig");
 pub const database = @import("database.zig");
 pub const testing = @import("testing.zig");
+pub const pipeline = @import("pipeline.zig");
 
 test {
     _ = tokenizer;
@@ -19,4 +20,5 @@ test {
     _ = observability;
     _ = database;
     _ = testing;
+    _ = pipeline;
 }

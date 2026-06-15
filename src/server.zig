@@ -1,5 +1,6 @@
 const std = @import("std");
 const observability = @import("observability.zig");
+const pipeline = @import("pipeline.zig");
 
 var upload_counter: usize = 0;
 
@@ -8,6 +9,16 @@ pub const StaticServerOptions = struct {
     port: u16 = 5173,
     root: []const u8 = "dist",
     hook_runner: []const u8 = ".yaan/hook_runner",
+    /// In-process hook seam. When set, the request runs this composable layer
+    /// chain instead of spawning the hook_runner subprocess. The framework
+    /// installs `frameworkHook` here for the dev server; tests can inject their
+    /// own. Null preserves the legacy subprocess path.
+    hook: ?Hook = null,
+    /// In-process load/action/remote handlers. When set, the request runs them
+    /// linked into the server instead of spawning the matching runner subprocess.
+    load: ?LoadFn = null,
+    action: ?ActionFn = null,
+    remote: ?RemoteFn = null,
     load_runner: []const u8 = ".yaan/load_runner",
     action_runner: []const u8 = ".yaan/action_runner",
     remote_runner: []const u8 = ".yaan/remote_runner",
@@ -195,35 +206,63 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
     }
 
     var path = sanitizePath(target);
-    const hook_json = runHookRunner(io, allocator, options.hook_runner, method, target, path, request.body) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
+    // Decision data must outlive the routing/static phases below (response
+    // headers reference it), so these live at function scope.
+    var hook_decision: ?HookDecision = null;
+    defer if (hook_decision) |d| d.deinit(allocator);
+    var hook_json: ?[]u8 = null;
     defer if (hook_json) |json| allocator.free(json);
-    var hook_result = if (hook_json) |json| try std.json.parseFromSlice(HookRunnerResult, allocator, json, .{}) else null;
+    var hook_result: ?std.json.Parsed(HookRunnerResult) = null;
     defer if (hook_result) |*result| result.deinit();
-    if (hook_result) |result| {
-        if (std.mem.eql(u8, result.value.action, "halt")) {
-            return try testMaybeRenderedResponse(io, allocator, options.root, accept, .{
+
+    if (options.hook) |hook| {
+        hook_decision = try hook(io, allocator, options.hook_runner, .{ .method = method, .target = target, .path = path, .body = request.body });
+        switch (hook_decision.?) {
+            .halt => |h| return try testMaybeRenderedResponse(io, allocator, options.root, accept, .{
                 .__yaan_response = true,
-                .status = result.value.status,
-                .content_type = result.value.content_type,
-                .location = result.value.location,
-                .headers = result.value.headers,
-                .body = result.value.body,
-            }, response_headers.items, options.debug_errors);
+                .status = h.status,
+                .content_type = h.content_type,
+                .location = h.location,
+                .headers = h.headers,
+                .body = h.body,
+            }, response_headers.items, options.debug_errors),
+            .continue_ => |c| {
+                if (c.path) |rewritten| path = sanitizePath(rewritten);
+                try response_headers.appendSlice(allocator, c.headers);
+            },
         }
-        if (!std.mem.eql(u8, result.value.action, "continue")) return error.InvalidHookResult;
-        if (result.value.path) |rewritten| path = sanitizePath(rewritten);
-        try response_headers.appendSlice(allocator, result.value.headers);
+    } else {
+        hook_json = runHookRunner(io, allocator, options.hook_runner, method, target, path, request.body) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        hook_result = if (hook_json) |json| try std.json.parseFromSlice(HookRunnerResult, allocator, json, .{}) else null;
+        if (hook_result) |result| {
+            if (std.mem.eql(u8, result.value.action, "halt")) {
+                return try testMaybeRenderedResponse(io, allocator, options.root, accept, .{
+                    .__yaan_response = true,
+                    .status = result.value.status,
+                    .content_type = result.value.content_type,
+                    .location = result.value.location,
+                    .headers = result.value.headers,
+                    .body = result.value.body,
+                }, response_headers.items, options.debug_errors);
+            }
+            if (!std.mem.eql(u8, result.value.action, "continue")) return error.InvalidHookResult;
+            if (result.value.path) |rewritten| path = sanitizePath(rewritten);
+            try response_headers.appendSlice(allocator, result.value.headers);
+        }
     }
 
     if (std.mem.eql(u8, method, "POST")) {
         if (std.mem.eql(u8, path, "/_yaan/remote")) {
-            const data = runRemoteRunner(io, allocator, options.remote_runner, method, path, request.body) catch |err| switch (err) {
-                error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_remote_runner\"}"),
-                else => return err,
-            };
+            const data = if (options.remote) |f|
+                try f(io, allocator, method, path, request.body)
+            else
+                runRemoteRunner(io, allocator, options.remote_runner, method, path, request.body) catch |err| switch (err) {
+                    error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_remote_runner\"}"),
+                    else => return err,
+                };
             defer allocator.free(data);
             return try testRunnerOutput(io, allocator, options.root, accept, data, response_headers.items, options.debug_errors);
         }
@@ -240,10 +279,13 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
             try allocator.dupe(u8, "[]");
         defer allocator.free(uploads_json);
 
-        const data = runActionRunner(io, allocator, options.action_runner, method, path, action_body, uploads_json) catch |err| switch (err) {
-            error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_action\"}"),
-            else => return err,
-        };
+        const data = if (options.action) |f|
+            try f(io, allocator, method, path, action_body, uploads_json)
+        else
+            runActionRunner(io, allocator, options.action_runner, method, path, action_body, uploads_json) catch |err| switch (err) {
+                error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_action\"}"),
+                else => return err,
+            };
         defer allocator.free(data);
         return try testRunnerOutput(io, allocator, options.root, accept, data, response_headers.items, options.debug_errors);
     }
@@ -258,10 +300,13 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
     if (std.mem.startsWith(u8, path, "/_yaan/load")) {
         const load_path = (try queryValue(allocator, target, "path")) orelse try allocator.dupe(u8, "/");
         defer allocator.free(load_path);
-        const data = runLoadRunner(io, allocator, options.load_runner, method, load_path) catch |err| switch (err) {
-            error.FileNotFound => try allocator.dupe(u8, "null"),
-            else => return err,
-        };
+        const data = if (options.load) |f|
+            try f(io, allocator, method, load_path)
+        else
+            runLoadRunner(io, allocator, options.load_runner, method, load_path) catch |err| switch (err) {
+                error.FileNotFound => try allocator.dupe(u8, "null"),
+                else => return err,
+            };
         defer allocator.free(data);
         return try testRunnerOutput(io, allocator, options.root, accept, data, response_headers.items, options.debug_errors);
     }
@@ -311,6 +356,159 @@ const HookRunnerResult = struct {
     headers: []const Header = &.{},
     body: []const u8 = "",
 };
+
+// --- in-process hook seam (wires src/pipeline.zig into the live request path) ---
+
+/// The slice of the request handed to an in-process hook.
+pub const HookRequest = struct {
+    method: []const u8,
+    target: []const u8,
+    path: []const u8,
+    body: []const u8,
+};
+
+/// The decision an in-process hook returns — the Zig-native equivalent of the
+/// JSON the hook_runner subprocess used to emit. All strings are owned by the
+/// allocator passed to the hook; the server frees them via `deinit`.
+pub const HookDecision = union(enum) {
+    continue_: Continue,
+    halt: Halt,
+
+    pub const Continue = struct {
+        path: ?[]const u8 = null,
+        headers: []const Header = &.{},
+    };
+    pub const Halt = struct {
+        status: u16 = 200,
+        content_type: []const u8 = "text/plain; charset=utf-8",
+        location: ?[]const u8 = null,
+        headers: []const Header = &.{},
+        body: []const u8 = "",
+    };
+
+    pub fn deinit(self: HookDecision, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .continue_ => |c| {
+                if (c.path) |p| allocator.free(p);
+                freeHeaders(allocator, c.headers);
+            },
+            .halt => |h| {
+                allocator.free(h.content_type);
+                if (h.location) |l| allocator.free(l);
+                allocator.free(h.body);
+                freeHeaders(allocator, h.headers);
+            },
+        }
+    }
+};
+
+pub const Hook = *const fn (io: std.Io, allocator: std.mem.Allocator, hook_runner: []const u8, request: HookRequest) anyerror!HookDecision;
+
+// In-process handler seams. Each returns the same JSON the corresponding runner
+// subprocess would have written to stdout, so the downstream rendering is
+// unchanged. Null falls back to the subprocess runner.
+pub const LoadFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8) anyerror![]u8;
+pub const ActionFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) anyerror![]u8;
+pub const RemoteFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8) anyerror![]u8;
+
+fn freeHeaders(allocator: std.mem.Allocator, headers: []const Header) void {
+    for (headers) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    allocator.free(headers);
+}
+
+fn dupeHeaders(allocator: std.mem.Allocator, headers: []const pipeline.Header) ![]Header {
+    const out = try allocator.alloc(Header, headers.len);
+    errdefer allocator.free(out);
+    for (headers, 0..) |h, i| {
+        out[i] = .{ .name = try allocator.dupe(u8, h.name), .value = try allocator.dupe(u8, h.value) };
+    }
+    return out;
+}
+
+// State threaded through the in-process hook chain. `io` and `runner` let the
+// terminal layer bridge to the existing subprocess user-hook; `rewrite` carries
+// a path rewrite back out.
+const HookLocals = struct {
+    io: std.Io,
+    runner: []const u8,
+    target: []const u8,
+    body: []const u8,
+    rewrite: ?[]const u8 = null,
+};
+
+const HookCtx = pipeline.Context(HookLocals);
+
+// A framework layer: stamps every response so it is observable that the
+// in-process pipeline ran, and demonstrates post-processing after `next`.
+const StampLayer = struct {
+    pub fn handle(ctx: *HookCtx, next: anytype) anyerror!pipeline.Outcome {
+        const outcome = try next.run(ctx);
+        try ctx.response.setHeader("x-yaan-pipeline", "in-process");
+        return outcome;
+    }
+};
+
+// Terminal: bridges to the existing hook_runner subprocess so user hooks keep
+// working. This is the seam that a future build that links user code would
+// replace with the user's own in-process layers.
+const SubprocessHook = struct {
+    pub fn handle(ctx: *HookCtx) anyerror!pipeline.Outcome {
+        const json = runHookRunner(ctx.locals.io, ctx.allocator, ctx.locals.runner, ctx.request.method, ctx.locals.target, ctx.request.path, ctx.locals.body) catch |err| switch (err) {
+            error.FileNotFound => return .done, // no user hook -> proceed
+            else => return err,
+        };
+        const parsed = std.json.parseFromSlice(HookRunnerResult, ctx.allocator, json, .{}) catch return error.InvalidHookResult;
+        const result = parsed.value;
+        for (result.headers) |h| try ctx.response.setHeader(h.name, h.value);
+        if (std.mem.eql(u8, result.action, "halt")) {
+            ctx.response.status = result.status;
+            ctx.response.content_type = result.content_type;
+            ctx.response.location = result.location;
+            ctx.response.body = result.body;
+            return .halt;
+        }
+        if (result.path) |p| ctx.locals.rewrite = p;
+        return .done;
+    }
+};
+
+const HookApp = pipeline.Pipeline(HookCtx, .{StampLayer}, SubprocessHook);
+
+/// The framework's in-process hook: runs a comptime-composed layer chain
+/// (`StampLayer` → subprocess bridge) and maps the result to a `HookDecision`.
+/// Installed on the dev server so real requests flow through the pipeline.
+pub fn frameworkHook(io: std.Io, allocator: std.mem.Allocator, hook_runner: []const u8, request: HookRequest) anyerror!HookDecision {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var response = pipeline.Response{ .allocator = a };
+    var ctx = HookCtx{
+        .allocator = a,
+        .request = .{ .method = request.method, .path = request.path, .body = request.body },
+        .response = &response,
+        .locals = .{ .io = io, .runner = hook_runner, .target = request.target, .body = request.body },
+    };
+    const outcome = try HookApp.run(&ctx);
+    // Copy the result out of the per-request arena into caller-owned memory.
+    const headers = try dupeHeaders(allocator, response.headers.items);
+    errdefer freeHeaders(allocator, headers);
+    if (outcome == .halt) {
+        return .{ .halt = .{
+            .status = response.status,
+            .content_type = try allocator.dupe(u8, response.content_type),
+            .location = if (response.location) |l| try allocator.dupe(u8, l) else null,
+            .body = try allocator.dupe(u8, response.body),
+            .headers = headers,
+        } };
+    }
+    return .{ .continue_ = .{
+        .path = if (ctx.locals.rewrite) |p| try allocator.dupe(u8, p) else null,
+        .headers = headers,
+    } };
+}
 
 const RunnerResponse = struct {
     __yaan_response: bool = false,
@@ -434,18 +632,48 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
     defer allocator.free(request_body);
 
     var path = sanitizePath(target);
-    const hook_json = hook: {
+    // Decision data must outlive the routing/static phases below.
+    var hook_decision: ?HookDecision = null;
+    defer if (hook_decision) |d| d.deinit(allocator);
+    var hook_json: ?[]u8 = null;
+    defer if (hook_json) |json| allocator.free(json);
+    var hook_result: ?std.json.Parsed(HookRunnerResult) = null;
+    defer if (hook_result) |*result| result.deinit();
+
+    {
         const span = try tracer.startChild(&trace, "yaan.hooks.handle");
         defer tracer.endSpan(&trace, span);
-        break :hook runHookRunner(io, allocator, hook_runner, method, target, path, request_body) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-    };
-    defer if (hook_json) |json| allocator.free(json);
-    var hook_result = if (hook_json) |json| try std.json.parseFromSlice(HookRunnerResult, allocator, json, .{}) else null;
-    defer if (hook_result) |*result| result.deinit();
-    if (hook_result) |result| {
+        if (options.hook) |hook| {
+            hook_decision = try hook(io, allocator, hook_runner, .{ .method = method, .target = target, .path = path, .body = request_body });
+        } else {
+            hook_json = runHookRunner(io, allocator, hook_runner, method, target, path, request_body) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            hook_result = if (hook_json) |json| try std.json.parseFromSlice(HookRunnerResult, allocator, json, .{}) else null;
+        }
+    }
+
+    if (hook_decision) |decision| {
+        switch (decision) {
+            .halt => |h| {
+                try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = h.status });
+                try writeMaybeRenderedResponse(io, allocator, stream, root, accept, .{
+                    .__yaan_response = true,
+                    .status = h.status,
+                    .content_type = h.content_type,
+                    .location = h.location,
+                    .headers = h.headers,
+                    .body = h.body,
+                }, response_headers_list.items, debug_errors);
+                return;
+            },
+            .continue_ => |c| {
+                if (c.path) |rewritten| path = sanitizePath(rewritten);
+                try response_headers_list.appendSlice(allocator, c.headers);
+            },
+        }
+    } else if (hook_result) |result| {
         if (std.mem.eql(u8, result.value.action, "halt")) {
             try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = result.value.status });
             try writeMaybeRenderedResponse(io, allocator, stream, root, accept, .{
@@ -468,6 +696,7 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
             const data = remote: {
                 const span = try tracer.startChild(&trace, "yaan.remote");
                 defer tracer.endSpan(&trace, span);
+                if (options.remote) |f| break :remote try f(io, allocator, method, path, request_body);
                 break :remote runRemoteRunner(io, allocator, remote_runner, method, path, request_body) catch |err| switch (err) {
                     error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_remote_runner\"}"),
                     else => return err,
@@ -493,6 +722,7 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
         const data = action: {
             const span = try tracer.startChild(&trace, "yaan.action");
             defer tracer.endSpan(&trace, span);
+            if (options.action) |f| break :action try f(io, allocator, method, path, action_body, uploads_json);
             break :action runActionRunner(io, allocator, action_runner, method, path, action_body, uploads_json) catch |err| switch (err) {
                 error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_action\"}"),
                 else => return err,
@@ -519,6 +749,7 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
             const span = try tracer.startChild(&trace, "yaan.load");
             defer tracer.endSpan(&trace, span);
             try tracer.setAttribute(span, "yaan.route.path", .{ .string = load_path });
+            if (options.load) |f| break :load try f(io, allocator, method, load_path);
             break :load runLoadRunner(io, allocator, load_runner, method, load_path) catch |err| switch (err) {
                 error.FileNotFound => try allocator.dupe(u8, "null"),
                 else => return err,
@@ -1293,6 +1524,69 @@ test "gzip round-trips and only encodes above threshold" {
     const raw = try encodeBody(allocator, "identity", "text/javascript", original);
     defer allocator.free(raw.body);
     try std.testing.expect(raw.encoding == null);
+}
+
+fn testHaltHook(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, request: HookRequest) anyerror!HookDecision {
+    _ = io;
+    _ = runner;
+    _ = request;
+    return .{ .halt = .{
+        .status = 403,
+        .content_type = try allocator.dupe(u8, "text/plain; charset=utf-8"),
+        .body = try allocator.dupe(u8, "blocked by layer"),
+        .headers = try allocator.alloc(Header, 0),
+    } };
+}
+
+fn testHeaderHook(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, request: HookRequest) anyerror!HookDecision {
+    _ = io;
+    _ = runner;
+    _ = request;
+    const headers = try allocator.alloc(Header, 1);
+    headers[0] = .{ .name = try allocator.dupe(u8, "x-test-layer"), .value = try allocator.dupe(u8, "1") };
+    return .{ .continue_ = .{ .headers = headers } };
+}
+
+test "in-process hook halts the request through the real pipeline" {
+    var res = try testRequest(std.testing.io, std.testing.allocator, .{
+        .root = ".",
+        .hook = &testHaltHook,
+    }, .{ .method = "GET", .target = "/anything" });
+    defer res.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), res.status);
+    try res.expectBodyContains("blocked by layer");
+}
+
+test "in-process hook continue headers reach the response" {
+    var res = try testRequest(std.testing.io, std.testing.allocator, .{
+        .root = ".",
+        .hook = &testHeaderHook,
+    }, .{ .method = "GET", .target = "/assets/missing.js" });
+    defer res.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), res.status); // continued to routing/static
+    try std.testing.expectEqualStrings("1", res.header("x-test-layer").?);
+}
+
+test "frameworkHook composes an in-process layer over the subprocess bridge" {
+    // No hook_runner exists, so the bridge terminal returns continue; the
+    // StampLayer must still have stamped the response on the way out.
+    const decision = try frameworkHook(std.testing.io, std.testing.allocator, ".yaan/does-not-exist", .{
+        .method = "GET",
+        .target = "/",
+        .path = "/",
+        .body = "",
+    });
+    defer decision.deinit(std.testing.allocator);
+    switch (decision) {
+        .continue_ => |c| {
+            var stamped = false;
+            for (c.headers) |h| {
+                if (std.mem.eql(u8, h.name, "x-yaan-pipeline")) stamped = true;
+            }
+            try std.testing.expect(stamped);
+        },
+        .halt => return error.UnexpectedHalt,
+    }
 }
 
 test "security headers append when enabled" {

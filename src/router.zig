@@ -463,12 +463,9 @@ pub fn generateLoadCheck(allocator: std.mem.Allocator, routes: []const RoutePatt
         \\const routes = @import("routes");
         \\
     );
-    var load_index: usize = 0;
     for (routes) |route| {
-        if (route.load_file) |load_file| {
-            _ = load_file;
-            try out.print(allocator, "const load_{d} = @import(\"load_{d}\");\n", .{ load_index, load_index });
-            load_index += 1;
+        if (route.load_file != null) {
+            try out.print(allocator, "const load_{s} = @import(\"load_{s}\");\n", .{ route.name, route.name });
         }
     }
     try out.appendSlice(allocator,
@@ -478,19 +475,19 @@ pub fn generateLoadCheck(allocator: std.mem.Allocator, routes: []const RoutePatt
         \\    const request = routes.Request{ .method = "GET", .path = "/" };
         \\
     );
-    load_index = 0;
+    var load_index: usize = 0;
     for (routes) |route| {
         if (route.load_file != null) {
             try out.print(allocator,
-                \\    const ctx_{d} = routes.LoadContext(.{s}){{ .allocator = allocator, .params = 
+                \\    const ctx_{d} = routes.LoadContext(.{s}){{ .allocator = allocator, .params =
             , .{ load_index, route.name });
             try writeParamsLiteral(allocator, &out, route);
             try out.print(allocator,
                 \\, .request = request }};
-                \\    const data_{d} = try load_{d}.load(ctx_{d});
+                \\    const data_{d} = try load_{s}.load(ctx_{d});
                 \\    _ = data_{d};
                 \\
-            , .{ load_index, load_index, load_index, load_index });
+            , .{ load_index, route.name, load_index, load_index });
             load_index += 1;
         }
     }
@@ -505,34 +502,32 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
         \\const routes = @import("routes");
         \\
     );
-    var load_index: usize = 0;
     for (routes) |route| {
         if (route.load_file != null) {
-            try out.print(allocator, "const load_{d} = @import(\"load_{d}\");\n", .{ load_index, load_index });
-            load_index += 1;
+            try out.print(allocator, "const load_{s} = @import(\"load_{s}\");\n", .{ route.name, route.name });
         }
     }
     try out.appendSlice(allocator,
         \\
-        \\pub fn main(init: std.process.Init) !void {
-        \\    const allocator = init.arena.allocator();
-        \\    const args = try init.minimal.args.toSlice(allocator);
-        \\    if (args.len < 3) return error.InvalidArguments;
-        \\    const method = args[1];
-        \\    const path = args[2];
-        \\    var stdout_buffer: [8192]u8 = undefined;
-        \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
-        \\    const writer = &stdout_file_writer.interface;
+        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8) ![]u8 {
+        \\    _ = io;
+        \\    var arena = std.heap.ArenaAllocator.init(allocator);
+        \\    defer arena.deinit();
+        \\    const a = arena.allocator();
+        \\    var out_writer: std.Io.Writer.Allocating = .init(a);
+        \\    try dispatch(a, &out_writer.writer, method, path);
+        \\    return try allocator.dupe(u8, out_writer.written());
+        \\}
+        \\
+        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8) !void {
         \\    const matched = (try routes.match(path, allocator)) orelse {
         \\        try writer.writeAll("null");
-        \\        try writer.flush();
         \\        return;
         \\    };
         \\    const request = routes.Request{ .method = method, .path = path };
         \\    switch (matched) {
         \\
     );
-    load_index = 0;
     for (routes) |route| {
         if (route.load_file != null) {
             if (paramCount(route) == 0) {
@@ -543,18 +538,17 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
             } else {
                 try out.print(allocator,
                     \\        .{s} => |params| {{
-                    \\            const ctx = routes.LoadContext(.{s}){{ .allocator = allocator, .params = 
+                    \\            const ctx = routes.LoadContext(.{s}){{ .allocator = allocator, .params =
                 , .{ route.name, route.name });
                 try writeParamsFromValue(allocator, &out, route, "params");
             }
             try out.print(allocator,
                 \\, .request = request }};
-                \\            const data = load_{d}.load(ctx) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                \\            const data = load_{s}.load(ctx) catch |err| return try writeUnexpected(allocator, writer, err, request);
                 \\            try writeRouteValue(allocator, writer, data);
                 \\        }},
                 \\
-            , .{load_index});
-            load_index += 1;
+            , .{route.name});
         } else {
             if (paramCount(route) == 0) {
                 try out.print(allocator,
@@ -571,7 +565,18 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
     }
     try out.appendSlice(allocator,
         \\    }
-        \\    try writer.flush();
+        \\}
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const allocator = init.arena.allocator();
+        \\    const args = try init.minimal.args.toSlice(allocator);
+        \\    if (args.len < 3) return error.InvalidArguments;
+        \\    const json = try run(init.io, allocator, args[1], args[2]);
+        \\    var stdout_buffer: [8192]u8 = undefined;
+        \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+        \\    const w = &stdout_file_writer.interface;
+        \\    try w.writeAll(json);
+        \\    try w.flush();
         \\}
         \\
         \\fn writeRouteValue(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: anytype) !void {
@@ -630,11 +635,9 @@ pub fn generateActionCheck(allocator: std.mem.Allocator, routes: []const RoutePa
         \\const routes = @import("routes");
         \\
     );
-    var action_index: usize = 0;
     for (routes) |route| {
         if (route.actions_file != null) {
-            try out.print(allocator, "const action_{d} = @import(\"action_{d}\");\n", .{ action_index, action_index });
-            action_index += 1;
+            try out.print(allocator, "const action_{s} = @import(\"action_{s}\");\n", .{ route.name, route.name });
         }
     }
     try out.appendSlice(allocator,
@@ -642,16 +645,16 @@ pub fn generateActionCheck(allocator: std.mem.Allocator, routes: []const RoutePa
         \\test "route actions type-check" {
         \\
     );
-    action_index = 0;
+    var action_index: usize = 0;
     for (routes) |route| {
         if (route.actions_file != null) {
             try out.print(allocator,
-                \\    const action_fn_{d} = action_{d}.action;
+                \\    const action_fn_{d} = action_{s}.action;
                 \\    _ = action_fn_{d};
-                \\    const form_type_{d}: type = action_{d}.Form;
+                \\    const form_type_{d}: type = action_{s}.Form;
                 \\    _ = form_type_{d};
                 \\
-            , .{ action_index, action_index, action_index, action_index, action_index, action_index });
+            , .{ action_index, route.name, action_index, action_index, route.name, action_index });
             action_index += 1;
         }
     }
@@ -666,61 +669,56 @@ pub fn generateActionRunner(allocator: std.mem.Allocator, routes: []const RouteP
         \\const routes = @import("routes");
         \\
     );
-    var action_index: usize = 0;
     for (routes) |route| {
         if (route.actions_file != null) {
-            try out.print(allocator, "const action_{d} = @import(\"action_{d}\");\n", .{ action_index, action_index });
-            action_index += 1;
+            try out.print(allocator, "const action_{s} = @import(\"action_{s}\");\n", .{ route.name, route.name });
         }
     }
     try out.appendSlice(allocator,
         \\
-        \\pub fn main(init: std.process.Init) !void {
-        \\    const allocator = init.arena.allocator();
-        \\    const args = try init.minimal.args.toSlice(allocator);
-        \\    if (args.len < 4) return error.InvalidArguments;
-        \\    const method = args[1];
-        \\    const path = args[2];
-        \\    const body = args[3];
-        \\    const uploads_json = if (args.len >= 5) args[4] else "[]";
+        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) ![]u8 {
+        \\    _ = io;
+        \\    var arena = std.heap.ArenaAllocator.init(allocator);
+        \\    defer arena.deinit();
+        \\    const a = arena.allocator();
+        \\    var out_writer: std.Io.Writer.Allocating = .init(a);
+        \\    try dispatch(a, &out_writer.writer, method, path, body, uploads_json);
+        \\    return try allocator.dupe(u8, out_writer.written());
+        \\}
+        \\
+        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) !void {
         \\    const uploads = try std.json.parseFromSliceLeaky([]routes.Upload, allocator, uploads_json, .{});
-        \\    var stdout_buffer: [8192]u8 = undefined;
-        \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
-        \\    const writer = &stdout_file_writer.interface;
         \\    const matched = (try routes.match(path, allocator)) orelse {
         \\        try writeResponseEnvelope(allocator, writer, routes.notFound("Route not found"));
-        \\        try writer.flush();
         \\        return;
         \\    };
         \\    const request = routes.Request{ .method = method, .path = path, .body = body, .uploads = uploads };
         \\    switch (matched) {
         \\
     );
-    action_index = 0;
     for (routes) |route| {
         if (route.actions_file != null) {
             if (paramCount(route) == 0) {
                 try out.print(allocator,
                     \\        .{s} => {{
-                    \\            const form = parseForm(action_{d}.Form, allocator, request) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                    \\            const form = parseForm(action_{s}.Form, allocator, request) catch |err| return try writeUnexpected(allocator, writer, err, request);
                     \\            const ctx = routes.ActionContext(.{s}){{ .allocator = allocator, .params = .{{}}
-                , .{ route.name, action_index, route.name });
+                , .{ route.name, route.name, route.name });
             } else {
                 try out.print(allocator,
                     \\        .{s} => |params| {{
-                    \\            const form = parseForm(action_{d}.Form, allocator, request) catch |err| return try writeUnexpected(allocator, writer, err, request);
-                    \\            const ctx = routes.ActionContext(.{s}){{ .allocator = allocator, .params = 
-                , .{ route.name, action_index, route.name });
+                    \\            const form = parseForm(action_{s}.Form, allocator, request) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                    \\            const ctx = routes.ActionContext(.{s}){{ .allocator = allocator, .params =
+                , .{ route.name, route.name, route.name });
                 try writeParamsFromValue(allocator, &out, route, "params");
             }
             try out.print(allocator,
                 \\, .request = request }};
-                \\            const result = action_{d}.action(ctx, form) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                \\            const result = action_{s}.action(ctx, form) catch |err| return try writeUnexpected(allocator, writer, err, request);
                 \\            try writeRouteValue(allocator, writer, result);
                 \\        }},
                 \\
-            , .{action_index});
-            action_index += 1;
+            , .{route.name});
         } else {
             if (paramCount(route) == 0) {
                 try out.print(allocator,
@@ -737,7 +735,19 @@ pub fn generateActionRunner(allocator: std.mem.Allocator, routes: []const RouteP
     }
     try out.appendSlice(allocator,
         \\    }
-        \\    try writer.flush();
+        \\}
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const allocator = init.arena.allocator();
+        \\    const args = try init.minimal.args.toSlice(allocator);
+        \\    if (args.len < 4) return error.InvalidArguments;
+        \\    const uploads_json = if (args.len >= 5) args[4] else "[]";
+        \\    const json = try run(init.io, allocator, args[1], args[2], args[3], uploads_json);
+        \\    var stdout_buffer: [8192]u8 = undefined;
+        \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+        \\    const w = &stdout_file_writer.interface;
+        \\    try w.writeAll(json);
+        \\    try w.flush();
         \\}
         \\
         \\fn writeRouteValue(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: anytype) !void {

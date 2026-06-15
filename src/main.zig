@@ -37,6 +37,10 @@ pub fn main(init: std.process.Init) !void {
             .host = host,
             .port = port,
             .root = "dist",
+            // Run the request through the in-process layer pipeline (which
+            // bridges to the hook_runner subprocess) instead of calling it
+            // directly. See src/pipeline.zig.
+            .hook = &yaan.server.frameworkHook,
             .observability = .{
                 .enabled = otel_endpoint != null,
                 .endpoint = otel_endpoint orelse "http://127.0.0.1:4318/v1/traces",

@@ -1885,24 +1885,24 @@ fn generateRemoteCheck(allocator: std.mem.Allocator, remotes: []const RemoteFunc
         \\const remote = @import("remote");
         \\
     );
-    for (remotes, 0..) |_, i| {
-        try out.print(allocator, "const remote_{d} = @import(\"remote_{d}\");\n", .{ i, i });
+    for (remotes) |remote_fn| {
+        try out.print(allocator, "const remote_{s} = @import(\"remote_{s}\");\n", .{ remote_fn.name, remote_fn.name });
     }
     try out.appendSlice(allocator,
         \\
         \\test "remote functions type-check" {
         \\
     );
-    for (remotes, 0..) |_, i| {
+    for (remotes, 0..) |remote_fn, i| {
         try out.print(allocator,
-            \\    const kind_{d}: remote.Kind = remote_{d}.kind;
+            \\    const kind_{d}: remote.Kind = remote_{s}.kind;
             \\    _ = kind_{d};
-            \\    const input_type_{d}: type = remote_{d}.Input;
+            \\    const input_type_{d}: type = remote_{s}.Input;
             \\    _ = input_type_{d};
-            \\    const remote_fn_{d} = remote_{d}.call;
+            \\    const remote_fn_{d} = remote_{s}.call;
             \\    _ = remote_fn_{d};
             \\
-        , .{ i, i, i, i, i, i, i, i, i });
+        , .{ i, remote_fn.name, i, i, remote_fn.name, i, i, remote_fn.name, i });
     }
     try out.appendSlice(allocator, "}\n");
     return out.toOwnedSlice(allocator);
@@ -1915,8 +1915,8 @@ fn generateRemoteManifest(allocator: std.mem.Allocator, remotes: []const RemoteF
         \\const remote = @import("remote");
         \\
     );
-    for (remotes, 0..) |_, i| {
-        try out.print(allocator, "const remote_{d} = @import(\"remote_{d}\");\n", .{ i, i });
+    for (remotes) |remote_fn| {
+        try out.print(allocator, "const remote_{s} = @import(\"remote_{s}\");\n", .{ remote_fn.name, remote_fn.name });
     }
     try out.appendSlice(allocator,
         \\
@@ -1926,11 +1926,11 @@ fn generateRemoteManifest(allocator: std.mem.Allocator, remotes: []const RemoteF
         \\    const writer = &stdout_file_writer.interface;
         \\
     );
-    for (remotes, 0..) |remote_fn, i| {
+    for (remotes) |remote_fn| {
         try out.print(allocator,
-            \\    try writeRemote(writer, "{s}", remote_{d}.kind);
+            \\    try writeRemote(writer, "{s}", remote_{s}.kind);
             \\
-        , .{ remote_fn.name, i });
+        , .{ remote_fn.name, remote_fn.name });
     }
     try out.appendSlice(allocator,
         \\    try writer.flush();
@@ -1951,8 +1951,8 @@ fn generateRemoteRunner(allocator: std.mem.Allocator, remotes: []const RemoteFun
         \\const remote = @import("remote");
         \\
     );
-    for (remotes, 0..) |_, i| {
-        try out.print(allocator, "const remote_{d} = @import(\"remote_{d}\");\n", .{ i, i });
+    for (remotes) |remote_fn| {
+        try out.print(allocator, "const remote_{s} = @import(\"remote_{s}\");\n", .{ remote_fn.name, remote_fn.name });
     }
     try out.appendSlice(allocator,
         \\
@@ -1962,27 +1962,40 @@ fn generateRemoteRunner(allocator: std.mem.Allocator, remotes: []const RemoteFun
         \\    input: std.json.Value = .null,
         \\};
         \\
+        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8) ![]u8 {
+        \\    _ = io;
+        \\    var arena = std.heap.ArenaAllocator.init(allocator);
+        \\    defer arena.deinit();
+        \\    const a = arena.allocator();
+        \\    var out_writer: std.Io.Writer.Allocating = .init(a);
+        \\    try dispatch(a, &out_writer.writer, method, path, body);
+        \\    return try allocator.dupe(u8, out_writer.written());
+        \\}
+        \\
         \\pub fn main(init: std.process.Init) !void {
         \\    const allocator = init.arena.allocator();
         \\    const args = try init.minimal.args.toSlice(allocator);
         \\    if (args.len < 4) return error.InvalidArguments;
-        \\    const method = args[1];
-        \\    const path = args[2];
-        \\    const body = args[3];
+        \\    const json = try run(init.io, allocator, args[1], args[2], args[3]);
         \\    var stdout_buffer: [8192]u8 = undefined;
         \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
-        \\    const writer = &stdout_file_writer.interface;
+        \\    const w = &stdout_file_writer.interface;
+        \\    try w.writeAll(json);
+        \\    try w.flush();
+        \\}
+        \\
+        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8, body: []const u8) !void {
         \\    const envelope = try std.json.parseFromSliceLeaky(Envelope, allocator, body, .{});
         \\    const request = remote.Request{ .method = method, .path = path, .body = body };
         \\
     );
-    for (remotes, 0..) |remote_fn, i| {
+    for (remotes) |remote_fn| {
         try out.print(allocator,
             \\    if (std.mem.eql(u8, envelope.name, "{s}")) {{
-            \\        if (!std.mem.eql(u8, envelope.kind, @tagName(remote_{d}.kind))) return try writeResponseEnvelope(allocator, writer, remote.fail(.bad_request, "remote_kind_mismatch", "Remote kind mismatch"));
-            \\        const input = parseInput(remote_{d}.Input, allocator, envelope.input) catch |err| return try writeUnexpected(allocator, writer, err, request);
+            \\        if (!std.mem.eql(u8, envelope.kind, @tagName(remote_{s}.kind))) return try writeResponseEnvelope(allocator, writer, remote.fail(.bad_request, "remote_kind_mismatch", "Remote kind mismatch"));
+            \\        const input = parseInput(remote_{s}.Input, allocator, envelope.input) catch |err| return try writeUnexpected(allocator, writer, err, request);
             \\        const ctx = remote.Context{{ .allocator = allocator, .request = request }};
-            \\        const value = remote_{d}.call(ctx, input) catch |err| return try writeUnexpected(allocator, writer, err, request);
+            \\        const value = remote_{s}.call(ctx, input) catch |err| return try writeUnexpected(allocator, writer, err, request);
             \\        if (@TypeOf(value) == void) {{
             \\            return try writeVoidResult(writer);
             \\        }} else {{
@@ -1990,7 +2003,7 @@ fn generateRemoteRunner(allocator: std.mem.Allocator, remotes: []const RemoteFun
             \\        }}
             \\    }}
             \\
-        , .{ remote_fn.name, i, i, i });
+        , .{ remote_fn.name, remote_fn.name, remote_fn.name, remote_fn.name });
     }
     try out.appendSlice(allocator,
         \\    return try writeResponseEnvelope(allocator, writer, remote.fail(.not_found, "remote_not_found", "Remote not found"));
@@ -2022,12 +2035,10 @@ fn generateRemoteRunner(allocator: std.mem.Allocator, remotes: []const RemoteFun
         \\    try writer.writeAll("{\"value\":");
         \\    try std.json.Stringify.value(value, .{}, writer);
         \\    try writer.writeAll("}");
-        \\    try writer.flush();
         \\}
         \\
         \\fn writeVoidResult(writer: *std.Io.Writer) !void {
         \\    try writer.writeAll("{\"value\":null}");
-        \\    try writer.flush();
         \\}
         \\
         \\fn writeUnexpected(allocator: std.mem.Allocator, writer: *std.Io.Writer, err: anyerror, request: remote.Request) !void {
@@ -2450,9 +2461,9 @@ fn appendRemoteModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]c
     try argv.append(allocator, "database");
     try argv.append(allocator, "--dep");
     try argv.append(allocator, "assets");
-    for (remotes, 0..) |_, i| {
+    for (remotes) |remote_fn| {
         try argv.append(allocator, "--dep");
-        try argv.append(allocator, try std.fmt.allocPrint(allocator, "remote_{d}", .{i}));
+        try argv.append(allocator, try std.fmt.allocPrint(allocator, "remote_{s}", .{remote_fn.name}));
     }
     try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mroot={s}", .{root}));
     try argv.append(allocator, "--dep");
@@ -2464,7 +2475,7 @@ fn appendRemoteModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]c
     try argv.append(allocator, "-Mdatabase=.yaan/database.zig");
     try argv.append(allocator, "-Massets=.yaan/assets.zig");
 
-    for (remotes, 0..) |remote_fn, i| {
+    for (remotes) |remote_fn| {
         try argv.append(allocator, "--dep");
         try argv.append(allocator, "remote");
         try argv.append(allocator, "--dep");
@@ -2473,7 +2484,7 @@ fn appendRemoteModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]c
         try argv.append(allocator, "database");
         try argv.append(allocator, "--dep");
         try argv.append(allocator, "assets");
-        try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mremote_{d}={s}", .{ i, remote_fn.file }));
+        try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mremote_{s}={s}", .{ remote_fn.name, remote_fn.file }));
     }
 }
 
@@ -2543,11 +2554,6 @@ fn appendActionCompileArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]
 }
 
 fn appendActionModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), routes: []const router.RoutePattern, root: []const u8) !void {
-    var action_count: usize = 0;
-    for (routes) |route| {
-        if (route.actions_file != null) action_count += 1;
-    }
-
     try argv.append(allocator, "--dep");
     try argv.append(allocator, "routes");
     try argv.append(allocator, "--dep");
@@ -2556,9 +2562,11 @@ fn appendActionModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]c
     try argv.append(allocator, "database");
     try argv.append(allocator, "--dep");
     try argv.append(allocator, "assets");
-    for (0..action_count) |i| {
-        try argv.append(allocator, "--dep");
-        try argv.append(allocator, try std.fmt.allocPrint(allocator, "action_{d}", .{i}));
+    for (routes) |route| {
+        if (route.actions_file != null) {
+            try argv.append(allocator, "--dep");
+            try argv.append(allocator, try std.fmt.allocPrint(allocator, "action_{s}", .{route.name}));
+        }
     }
     try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mroot={s}", .{root}));
     try argv.append(allocator, "--dep");
@@ -2570,7 +2578,6 @@ fn appendActionModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]c
     try argv.append(allocator, "-Mdatabase=.yaan/database.zig");
     try argv.append(allocator, "-Massets=.yaan/assets.zig");
 
-    var action_index: usize = 0;
     for (routes) |route| {
         if (route.actions_file) |actions_file| {
             try argv.append(allocator, "--dep");
@@ -2581,18 +2588,12 @@ fn appendActionModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]c
             try argv.append(allocator, "database");
             try argv.append(allocator, "--dep");
             try argv.append(allocator, "assets");
-            try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Maction_{d}={s}", .{ action_index, actions_file }));
-            action_index += 1;
+            try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Maction_{s}={s}", .{ route.name, actions_file }));
         }
     }
 }
 
 fn appendLoadModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), routes: []const router.RoutePattern, root: []const u8) !void {
-    var load_count: usize = 0;
-    for (routes) |route| {
-        if (route.load_file != null) load_count += 1;
-    }
-
     try argv.append(allocator, "--dep");
     try argv.append(allocator, "routes");
     try argv.append(allocator, "--dep");
@@ -2601,9 +2602,11 @@ fn appendLoadModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]con
     try argv.append(allocator, "database");
     try argv.append(allocator, "--dep");
     try argv.append(allocator, "assets");
-    for (0..load_count) |i| {
-        try argv.append(allocator, "--dep");
-        try argv.append(allocator, try std.fmt.allocPrint(allocator, "load_{d}", .{i}));
+    for (routes) |route| {
+        if (route.load_file != null) {
+            try argv.append(allocator, "--dep");
+            try argv.append(allocator, try std.fmt.allocPrint(allocator, "load_{s}", .{route.name}));
+        }
     }
     try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mroot={s}", .{root}));
     try argv.append(allocator, "--dep");
@@ -2615,7 +2618,6 @@ fn appendLoadModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]con
     try argv.append(allocator, "-Mdatabase=.yaan/database.zig");
     try argv.append(allocator, "-Massets=.yaan/assets.zig");
 
-    var load_index: usize = 0;
     for (routes) |route| {
         if (route.load_file) |load_file| {
             try argv.append(allocator, "--dep");
@@ -2626,8 +2628,7 @@ fn appendLoadModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]con
             try argv.append(allocator, "database");
             try argv.append(allocator, "--dep");
             try argv.append(allocator, "assets");
-            try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mload_{d}={s}", .{ load_index, load_file }));
-            load_index += 1;
+            try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mload_{s}={s}", .{ route.name, load_file }));
         }
     }
 }

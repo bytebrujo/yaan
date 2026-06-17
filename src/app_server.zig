@@ -19,11 +19,11 @@ const action_runner = @import("action_runner");
 const remote_runner = @import("remote_runner");
 
 // In-process load/action/remote: call the generated runners' `run()` directly.
-fn loadFn(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8) anyerror![]u8 {
-    return load_runner.run(io, allocator, method, path);
+fn loadFn(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, headers_json: []const u8, meta_json: []const u8) anyerror![]u8 {
+    return load_runner.run(io, allocator, method, path, headers_json, meta_json);
 }
-fn actionFn(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) anyerror![]u8 {
-    return action_runner.run(io, allocator, method, path, body, uploads_json);
+fn actionFn(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8, headers_json: []const u8, meta_json: []const u8) anyerror![]u8 {
+    return action_runner.run(io, allocator, method, path, body, uploads_json, headers_json, meta_json);
 }
 fn remoteFn(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8) anyerror![]u8 {
     return remote_runner.run(io, allocator, method, path, body);
@@ -76,7 +76,7 @@ fn userHook(io: std.Io, allocator: std.mem.Allocator, hook_runner: []const u8, r
         .locals = .{},
     };
     const decision = app_hooks.handle(&ctx) catch |err| {
-        const id = try std.fmt.allocPrint(a, "err-{s}", .{@errorName(err)});
+        const id = try hooks.errorId(a, err, ctx.request.path);
         var error_ctx = hooks.ErrorContext{ .allocator = a, .request = ctx.request, .err = err, .id = id };
         const response = if (@hasDecl(app_hooks, "onError")) app_hooks.onError(&error_ctx) else hooks.defaultOnError(&error_ctx);
         return halt(allocator, response);
@@ -98,6 +98,21 @@ pub fn main(init: std.process.Init) !void {
     const host = optionValue(args, "--host") orelse "127.0.0.1";
     const port_text = optionValue(args, "--port") orelse "5173";
     const port = try std.fmt.parseInt(u16, port_text, 10);
+    const debug_errors = optionFlag(args, "--debug-errors");
+    const trusted_proxies = try optionList(allocator, args, "--trusted-proxy");
+    const force_https = optionFlag(args, "--force-https");
+    const hsts = optionFlag(args, "--hsts");
+    const hsts_max_age = try parseU32Option(args, "--hsts-max-age", 31_536_000);
+    const max_body_length = try parseUsizeOption(args, "--max-body", 8 * 1024 * 1024);
+    const max_upload_file_length = try parseUsizeOption(args, "--max-upload-file", 8 * 1024 * 1024);
+    const max_upload_count = try parseUsizeOption(args, "--max-upload-count", 16);
+    const max_form_fields_length = try parseUsizeOption(args, "--max-form-fields", 1024 * 1024);
+    const max_multipart_header_length = try parseUsizeOption(args, "--max-multipart-header", 16 * 1024);
+    const max_header_length = try parseUsizeOption(args, "--max-headers", 32 * 1024);
+    const read_timeout_ms = try parseU32Option(args, "--read-timeout-ms", 10_000);
+    const cookie_secret = optionValue(args, "--cookie-secret") orelse init.environ_map.get("YAAN_COOKIE_SECRET") orelse "";
+    const csrf_protection = optionFlag(args, "--csrf");
+    if (csrf_protection and cookie_secret.len == 0) return error.MissingCookieSecret;
 
     // Generate the app's dist + .yaan artifacts. No runner SUBPROCESSES are
     // built — hook, load, action, and remote all run in-process now.
@@ -112,6 +127,24 @@ pub fn main(init: std.process.Init) !void {
         .load = &loadFn,
         .action = &actionFn,
         .remote = &remoteFn,
+        // The in-process server is the production deploy artifact, so it is
+        // production-safe by default: internals never leak. `--debug-errors`
+        // opts into verbose error pages for local development (the dev-inproc
+        // build step passes it).
+        .debug_errors = debug_errors,
+        .trusted_proxies = trusted_proxies,
+        .force_https = force_https,
+        .hsts = hsts,
+        .hsts_max_age = hsts_max_age,
+        .max_body_length = max_body_length,
+        .max_upload_file_length = max_upload_file_length,
+        .max_upload_count = max_upload_count,
+        .max_form_fields_length = max_form_fields_length,
+        .max_multipart_header_length = max_multipart_header_length,
+        .max_header_length = max_header_length,
+        .read_timeout_ms = read_timeout_ms,
+        .cookie_secret = cookie_secret,
+        .csrf_protection = csrf_protection,
     });
 }
 
@@ -121,4 +154,30 @@ fn optionValue(args: []const []const u8, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, args[i], name) and i + 1 < args.len) return args[i + 1];
     }
     return null;
+}
+
+fn optionFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, name)) return true;
+    }
+    return false;
+}
+
+fn optionList(allocator: std.mem.Allocator, args: []const []const u8, name: []const u8) ![]const []const u8 {
+    const raw = optionValue(args, name) orelse return &.{};
+    var items: std.ArrayList([]const u8) = .empty;
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) try items.append(allocator, trimmed);
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+fn parseUsizeOption(args: []const []const u8, name: []const u8, default: usize) !usize {
+    return try std.fmt.parseInt(usize, optionValue(args, name) orelse return default, 10);
+}
+
+fn parseU32Option(args: []const []const u8, name: []const u8, default: u32) !u32 {
+    return try std.fmt.parseInt(u32, optionValue(args, name) orelse return default, 10);
 }

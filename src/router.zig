@@ -306,6 +306,12 @@ pub fn generateZigRoutes(allocator: std.mem.Allocator, routes: []const RoutePatt
         \\    size: usize,
         \\};
         \\
+        \\pub const RequestMeta = struct {
+        \\    secure: bool = false,
+        \\    csrf_protection: bool = false,
+        \\    cookie_secret: []const u8 = "",
+        \\};
+        \\
         \\pub const Request = struct {
         \\    method: []const u8,
         \\    path: []const u8,
@@ -313,6 +319,7 @@ pub fn generateZigRoutes(allocator: std.mem.Allocator, routes: []const RoutePatt
         \\    headers: []const Header = &.{},
         \\    body: []const u8 = "",
         \\    uploads: []const Upload = &.{},
+        \\    meta: RequestMeta = .{},
         \\
         \\    pub fn upload(self: Request, name: []const u8) ?Upload {
         \\        for (self.uploads) |item| {
@@ -320,7 +327,118 @@ pub fn generateZigRoutes(allocator: std.mem.Allocator, routes: []const RoutePatt
         \\        }
         \\        return null;
         \\    }
+        \\
+        \\    pub fn header(self: Request, name: []const u8) ?[]const u8 {
+        \\        for (self.headers) |item| {
+        \\            if (std.ascii.eqlIgnoreCase(item.name, name)) return item.value;
+        \\        }
+        \\        return null;
+        \\    }
+        \\
+        \\    pub fn cookie(self: Request, name: []const u8) ?[]const u8 {
+        \\        const raw = self.header("cookie") orelse return null;
+        \\        var parts = std.mem.splitScalar(u8, raw, ';');
+        \\        while (parts.next()) |part| {
+        \\            const trimmed = std.mem.trim(u8, part, " \t");
+        \\            const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        \\            if (std.mem.eql(u8, trimmed[0..eq], name)) return trimmed[eq + 1 ..];
+        \\        }
+        \\        return null;
+        \\    }
+        \\
+        \\    pub fn signedCookie(self: Request, allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+        \\        const raw = self.cookie(name) orelse return null;
+        \\        return try verifySignedCookie(allocator, name, raw, self.meta.cookie_secret);
+        \\    }
         \\};
+        \\
+        \\pub const CookieOptions = struct {
+        \\    path: []const u8 = "/",
+        \\    http_only: bool = true,
+        \\    same_site: []const u8 = "Lax",
+        \\    secure: bool = false,
+        \\    max_age: ?u32 = null,
+        \\};
+        \\
+        \\pub fn setCookie(allocator: std.mem.Allocator, name: []const u8, value: []const u8, options: CookieOptions) !Header {
+        \\    var out: std.ArrayList(u8) = .empty;
+        \\    try out.print(allocator, "{s}={s}; Path={s}; SameSite={s}", .{ name, value, options.path, options.same_site });
+        \\    if (options.http_only) try out.appendSlice(allocator, "; HttpOnly");
+        \\    if (options.secure) try out.appendSlice(allocator, "; Secure");
+        \\    if (options.max_age) |age| try out.print(allocator, "; Max-Age={d}", .{age});
+        \\    return .{ .name = "set-cookie", .value = try out.toOwnedSlice(allocator) };
+        \\}
+        \\
+        \\pub fn clearCookie(allocator: std.mem.Allocator, name: []const u8, secure: bool) !Header {
+        \\    return setCookie(allocator, name, "", .{ .secure = secure, .max_age = 0 });
+        \\}
+        \\
+        \\pub fn signedCookieHeader(allocator: std.mem.Allocator, request: Request, name: []const u8, value: []const u8) !Header {
+        \\    const signed = try signedCookieValue(allocator, name, value, request.meta.cookie_secret);
+        \\    return setCookie(allocator, name, signed, .{ .secure = request.meta.secure });
+        \\}
+        \\
+        \\pub const CsrfPair = struct {
+        \\    header: Header,
+        \\    token: []const u8,
+        \\};
+        \\
+        \\pub fn csrfPair(allocator: std.mem.Allocator, request: Request) !CsrfPair {
+        \\    var random_bytes: [24]u8 = undefined;
+        \\    std.crypto.random.bytes(&random_bytes);
+        \\    const nonce = try base64Encode(allocator, &random_bytes);
+        \\    defer allocator.free(nonce);
+        \\    const signed = try signedCookieValue(allocator, "yaan_csrf", nonce, request.meta.cookie_secret);
+        \\    const header = try setCookie(allocator, "yaan_csrf", signed, .{ .secure = request.meta.secure });
+        \\    return .{ .header = header, .token = signed };
+        \\}
+        \\
+        \\pub fn signedCookieValue(allocator: std.mem.Allocator, name: []const u8, value: []const u8, secret: []const u8) ![]u8 {
+        \\    if (secret.len == 0) return error.MissingCookieSecret;
+        \\    const encoded_value = try base64Encode(allocator, value);
+        \\    defer allocator.free(encoded_value);
+        \\    const signed_part = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ name, encoded_value });
+        \\    defer allocator.free(signed_part);
+        \\    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        \\    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signed_part, secret);
+        \\    const encoded_mac = try base64Encode(allocator, &mac);
+        \\    defer allocator.free(encoded_mac);
+        \\    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ encoded_value, encoded_mac });
+        \\}
+        \\
+        \\pub fn verifySignedCookie(allocator: std.mem.Allocator, name: []const u8, signed_value: []const u8, secret: []const u8) !?[]u8 {
+        \\    if (secret.len == 0) return error.MissingCookieSecret;
+        \\    const dot = std.mem.lastIndexOfScalar(u8, signed_value, '.') orelse return null;
+        \\    const encoded_value = signed_value[0..dot];
+        \\    const encoded_mac = signed_value[dot + 1 ..];
+        \\    const signed_part = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ name, encoded_value });
+        \\    defer allocator.free(signed_part);
+        \\    var expected: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        \\    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, signed_part, secret);
+        \\    const actual = base64Decode(allocator, encoded_mac) catch return null;
+        \\    defer allocator.free(actual);
+        \\    if (actual.len != expected.len) return null;
+        \\    var actual_array: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        \\    @memcpy(actual_array[0..], actual);
+        \\    if (!std.crypto.timing_safe.eql([std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8, actual_array, expected)) return null;
+        \\    return base64Decode(allocator, encoded_value) catch return null;
+        \\}
+        \\
+        \\fn base64Encode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+        \\    const encoder = std.base64.url_safe_no_pad.Encoder;
+        \\    const out = try allocator.alloc(u8, encoder.calcSize(value.len));
+        \\    _ = encoder.encode(out, value);
+        \\    return out;
+        \\}
+        \\
+        \\fn base64Decode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+        \\    const decoder = std.base64.url_safe_no_pad.Decoder;
+        \\    const size = try decoder.calcSizeForSlice(value);
+        \\    const out = try allocator.alloc(u8, size);
+        \\    errdefer allocator.free(out);
+        \\    try decoder.decode(out, value);
+        \\    return out;
+        \\}
         \\
         \\pub const TraceValue = union(enum) {
         \\    string: []const u8,
@@ -509,22 +627,24 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
     }
     try out.appendSlice(allocator,
         \\
-        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8) ![]u8 {
+        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, headers_json: []const u8, meta_json: []const u8) ![]u8 {
         \\    _ = io;
         \\    var arena = std.heap.ArenaAllocator.init(allocator);
         \\    defer arena.deinit();
         \\    const a = arena.allocator();
         \\    var out_writer: std.Io.Writer.Allocating = .init(a);
-        \\    try dispatch(a, &out_writer.writer, method, path);
+        \\    try dispatch(a, &out_writer.writer, method, path, headers_json, meta_json);
         \\    return try allocator.dupe(u8, out_writer.written());
         \\}
         \\
-        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8) !void {
+        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8, headers_json: []const u8, meta_json: []const u8) !void {
+        \\    const headers = try std.json.parseFromSliceLeaky([]routes.Header, allocator, headers_json, .{});
+        \\    const meta = try std.json.parseFromSliceLeaky(routes.RequestMeta, allocator, meta_json, .{});
         \\    const matched = (try routes.match(path, allocator)) orelse {
         \\        try writer.writeAll("null");
         \\        return;
         \\    };
-        \\    const request = routes.Request{ .method = method, .path = path };
+        \\    const request = routes.Request{ .method = method, .path = path, .headers = headers, .meta = meta };
         \\    switch (matched) {
         \\
     );
@@ -571,7 +691,9 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
         \\    const allocator = init.arena.allocator();
         \\    const args = try init.minimal.args.toSlice(allocator);
         \\    if (args.len < 3) return error.InvalidArguments;
-        \\    const json = try run(init.io, allocator, args[1], args[2]);
+        \\    const headers_json = if (args.len >= 4) args[3] else "[]";
+        \\    const meta_json = if (args.len >= 5) args[4] else "{}";
+        \\    const json = try run(init.io, allocator, args[1], args[2], headers_json, meta_json);
         \\    var stdout_buffer: [8192]u8 = undefined;
         \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
         \\    const w = &stdout_file_writer.interface;
@@ -676,23 +798,25 @@ pub fn generateActionRunner(allocator: std.mem.Allocator, routes: []const RouteP
     }
     try out.appendSlice(allocator,
         \\
-        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) ![]u8 {
+        \\pub fn run(io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8, headers_json: []const u8, meta_json: []const u8) ![]u8 {
         \\    _ = io;
         \\    var arena = std.heap.ArenaAllocator.init(allocator);
         \\    defer arena.deinit();
         \\    const a = arena.allocator();
         \\    var out_writer: std.Io.Writer.Allocating = .init(a);
-        \\    try dispatch(a, &out_writer.writer, method, path, body, uploads_json);
+        \\    try dispatch(a, &out_writer.writer, method, path, body, uploads_json, headers_json, meta_json);
         \\    return try allocator.dupe(u8, out_writer.written());
         \\}
         \\
-        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) !void {
+        \\fn dispatch(allocator: std.mem.Allocator, writer: *std.Io.Writer, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8, headers_json: []const u8, meta_json: []const u8) !void {
         \\    const uploads = try std.json.parseFromSliceLeaky([]routes.Upload, allocator, uploads_json, .{});
+        \\    const headers = try std.json.parseFromSliceLeaky([]routes.Header, allocator, headers_json, .{});
+        \\    const meta = try std.json.parseFromSliceLeaky(routes.RequestMeta, allocator, meta_json, .{});
         \\    const matched = (try routes.match(path, allocator)) orelse {
         \\        try writeResponseEnvelope(allocator, writer, routes.notFound("Route not found"));
         \\        return;
         \\    };
-        \\    const request = routes.Request{ .method = method, .path = path, .body = body, .uploads = uploads };
+        \\    const request = routes.Request{ .method = method, .path = path, .body = body, .uploads = uploads, .headers = headers, .meta = meta };
         \\    switch (matched) {
         \\
     );
@@ -742,7 +866,9 @@ pub fn generateActionRunner(allocator: std.mem.Allocator, routes: []const RouteP
         \\    const args = try init.minimal.args.toSlice(allocator);
         \\    if (args.len < 4) return error.InvalidArguments;
         \\    const uploads_json = if (args.len >= 5) args[4] else "[]";
-        \\    const json = try run(init.io, allocator, args[1], args[2], args[3], uploads_json);
+        \\    const headers_json = if (args.len >= 6) args[5] else "[]";
+        \\    const meta_json = if (args.len >= 7) args[6] else "{}";
+        \\    const json = try run(init.io, allocator, args[1], args[2], args[3], uploads_json, headers_json, meta_json);
         \\    var stdout_buffer: [8192]u8 = undefined;
         \\    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
         \\    const w = &stdout_file_writer.interface;

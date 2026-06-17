@@ -505,6 +505,54 @@ project loaders and executes them through `/_yaan/load?path=...`. The browser
 router fetches that endpoint before creating the page and passes the JSON result
 as `props.data`.
 
+## Layouts
+
+A `+layout.yn` wraps every page in its directory subtree. It is an ordinary
+component with exactly one `<slot></slot>` marking where the child — the next
+nested layout, or the page — is mounted:
+
+```txt
+src/routes/+layout.yn            -> wraps every route (root layout)
+src/routes/(docs)/+layout.yn     -> wraps every route under the (docs) group
+src/routes/blog/+layout.yn       -> wraps /blog and everything beneath it
+```
+
+```html
+<header>…site chrome…</header>
+<slot></slot>
+<footer>…</footer>
+```
+
+Each page resolves to an ordered chain of layouts, outermost (root) first, with
+the page innermost. Layouts compose by nesting: the root layout's slot holds the
+next layout, whose slot holds the page. `(group)` directories — already pathless
+in the URL — scope a layout to just that group, exactly like SvelteKit.
+
+The chain is prerendered nested into `#app` and surfaced in `.yaan/routes.zig`
+metadata, so each route record carries its `layouts` module list. On client
+navigation the router keeps a layout **mounted** as long as both its module and
+its loaded data are unchanged, and rebuilds only the divergent tail — so a parent
+layout's state survives sibling navigations, while a layout whose data changed
+(or the page itself, whose params/data/form vary every navigation) is rebuilt.
+
+A layout can load its own data with a sibling `+layout.load.zig`. Because one
+layout wraps many routes with different param shapes, layout loaders are generic
+over the context:
+
+```zig
+pub const Data = struct { framework: []const u8, year: u16 };
+
+pub fn load(ctx: anytype) !Data { // ctx.allocator / ctx.request available
+    _ = ctx;
+    return .{ .framework = "Yaan", .year = 2026 };
+}
+```
+
+When any layout in a chain has a loader, `/_yaan/load` returns a chain envelope
+(`{ data, layouts: [...] }`) that the router unwraps into each level's
+`props.data`. Layouts without a loader receive `null`. `yaan init` scaffolds a
+root `+layout.yn` + `+layout.load.zig` so new projects start with site chrome.
+
 Dioxus-style server functions live in `src/remotes` as one remote per
 `*.remote.zig` file:
 

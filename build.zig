@@ -64,6 +64,9 @@ pub fn addInProcessServer(b: *std.Build, opts: InProcessOptions) *std.Build.Step
     var load_imports: std.ArrayList(std.Build.Module.Import) = .empty;
     load_imports.append(b.allocator, .{ .name = "routes", .module = routes_mod }) catch @panic("oom");
     discoverHandlers(b, target, &load_imports, "src/routes", "+load.zig", "load", &route_imports);
+    // Layout loaders share the load runner's module graph; named by a hash of
+    // their file path so this matches the runner codegen exactly.
+    discoverLayoutLoads(b, target, &load_imports, &route_imports);
 
     var action_imports: std.ArrayList(std.Build.Module.Import) = .empty;
     action_imports.append(b.allocator, .{ .name = "routes", .module = routes_mod }) catch @panic("oom");
@@ -155,6 +158,29 @@ fn discoverHandlers(
         const rel_dir = std.fs.path.dirname(entry.path) orelse "";
         const name = std.fmt.allocPrint(b.allocator, "{s}_{s}", .{ prefix, routeName(b.allocator, rel_dir) }) catch @panic("oom");
         const file = std.fs.path.join(b.allocator, &.{ base, entry.path }) catch @panic("oom");
+        const mod = b.createModule(.{ .root_source_file = b.path(file), .target = target, .imports = handler_imports });
+        imports.append(b.allocator, .{ .name = name, .module = mod }) catch @panic("oom");
+    }
+}
+
+/// Discovers `+layout.load.zig` files and wires each as `layout_load_<hash>`,
+/// where the hash is `Wyhash` of the file path — identical to the name the load
+/// runner codegen imports (see router.layoutLoadName).
+fn discoverLayoutLoads(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    imports: *std.ArrayList(std.Build.Module.Import),
+    handler_imports: []const std.Build.Module.Import,
+) void {
+    const io = b.graph.io;
+    var dir = b.build_root.handle.openDir(io, "src/routes", .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("oom");
+    defer walker.deinit();
+    while (walker.next(io) catch @panic("walk")) |entry| {
+        if (entry.kind != .file or !std.mem.eql(u8, entry.basename, "+layout.load.zig")) continue;
+        const file = std.fmt.allocPrint(b.allocator, "src/routes/{s}", .{entry.path}) catch @panic("oom");
+        const name = std.fmt.allocPrint(b.allocator, "layout_load_{x}", .{std.hash.Wyhash.hash(0, file)}) catch @panic("oom");
         const mod = b.createModule(.{ .root_source_file = b.path(file), .target = target, .imports = handler_imports });
         imports.append(b.allocator, .{ .name = name, .module = mod }) catch @panic("oom");
     }

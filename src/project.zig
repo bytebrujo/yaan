@@ -1,7 +1,9 @@
 const std = @import("std");
 const parser = @import("parser.zig");
+const tokenizer = @import("tokenizer.zig");
 const codegen = @import("codegen.zig");
 const router = @import("router.zig");
+const diagnostics = @import("diagnostics.zig");
 
 const database_source = @embedFile("database.zig");
 
@@ -98,45 +100,407 @@ pub fn checkSource(allocator: std.mem.Allocator, path: []const u8, source: []con
     return .{ .ok = component.diagnostics.len == 0, .diagnostics = component.diagnostics.len };
 }
 
-pub fn checkProject(io: std.Io, allocator: std.mem.Allocator) !usize {
-    var routes = try discoverRoutes(io, allocator);
-    defer deinitRoutes(&routes, allocator);
-    var remotes = try discoverRemotes(io, allocator);
-    defer deinitRemotes(&remotes, allocator);
-    var failures = validateRouteSet(routes.items);
-    failures += validateRemoteSet(remotes.items);
+// ── Phase-based build pipeline (§1, §2) ──────────────────────────────────────
+//
+// `checkProject` and `buildProject` share one `Build` context that flows through
+// explicit phases: scan → parse → analyze → emit → (render). Each phase advances
+// `stage`; debug builds assert the ordering. Semantic checks append source-located
+// `Diagnostic`s to `diags` instead of printing ad-hoc, and rendering only runs once
+// the error tally is zero. Output bytes for a valid app are byte-identical to the
+// previous straight-line orchestrator.
 
-    const cwd = std.Io.Dir.cwd();
-    for (routes.items) |route| {
-        const source = try cwd.readFileAlloc(io, route.file, allocator, .limited(4 * 1024 * 1024));
-        var component = try parser.parse(allocator, source);
-        defer parser.deinitComponent(&component, allocator);
-        if (component.diagnostics.len > 0) {
-            failures += component.diagnostics.len;
-            for (component.diagnostics) |diag| {
-                var toks = @import("tokenizer.zig").Tokenizer.init(allocator, source);
-                defer toks.deinit();
-                const pos = toks.position(diag.offset);
-                std.debug.print("{s}:{d}:{d}: {s}\n", .{ route.file, pos.line, pos.column, diag.message });
+const Stage = enum(u8) { init, scanned, parsed, analyzed, emitted, rendered };
+
+/// Per-route pipeline state (§1). `index` points into `Build.routes`; the parsed
+/// component (and the source buffer it borrows from) are owned here and live until
+/// `Build.deinit`, so the source is parsed once and `phaseRender` reuses it.
+const RouteNode = struct {
+    index: usize,
+    source: []const u8 = "",
+    component: parser.Component = .{ .source = "" },
+    parsed: bool = false,
+
+    fn deinit(self: *RouteNode, allocator: std.mem.Allocator) void {
+        if (self.parsed) {
+            parser.deinitComponent(&self.component, allocator);
+            allocator.free(self.source);
+        }
+    }
+};
+
+/// A layout deduplicated by source path, parsed once and shared by every route
+/// whose chain includes it. `module`/`skeleton` are filled during `phaseRender`.
+const LayoutNode = struct {
+    file: []const u8, // borrowed from a route's LayoutRef
+    source: []const u8 = "",
+    component: parser.Component = .{ .source = "" },
+    parsed: bool = false,
+    module: []u8 = &.{}, // "./pages/layoutN.js"
+    skeleton: []u8 = &.{}, // prerender skeleton (carries the slot sentinel)
+    rendered: bool = false,
+
+    fn deinit(self: *LayoutNode, allocator: std.mem.Allocator) void {
+        if (self.parsed) {
+            parser.deinitComponent(&self.component, allocator);
+            allocator.free(self.source);
+        }
+        if (self.rendered) {
+            allocator.free(self.module);
+            allocator.free(self.skeleton);
+        }
+    }
+};
+
+/// The unified build context threaded through every phase. `out_dir` is the dist
+/// output directory in build mode and `null` in check mode (no browser assets are
+/// written). All cross-phase state lives here; phase-internal state stays local to
+/// its phase function.
+const Build = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    out_dir: ?[]const u8,
+    diags: diagnostics.Bag,
+    routes: std.ArrayList(router.RoutePattern) = .empty,
+    remotes: std.ArrayList(RemoteFunction) = .empty,
+    nodes: []RouteNode = &.{},
+    layouts: std.ArrayList(LayoutNode) = .empty,
+    stage: Stage = .init,
+
+    fn init(io: std.Io, gpa: std.mem.Allocator, out_dir: ?[]const u8) Build {
+        return .{ .io = io, .gpa = gpa, .out_dir = out_dir, .diags = diagnostics.Bag.init(gpa) };
+    }
+
+    fn deinit(self: *Build) void {
+        for (self.nodes) |*n| n.deinit(self.gpa);
+        self.gpa.free(self.nodes);
+        for (self.layouts.items) |*l| l.deinit(self.gpa);
+        self.layouts.deinit(self.gpa);
+        deinitRoutes(&self.routes, self.gpa);
+        deinitRemotes(&self.remotes, self.gpa);
+        self.diags.deinit();
+    }
+
+    fn advance(self: *Build, from: Stage, to: Stage) void {
+        std.debug.assert(self.stage == from);
+        self.stage = to;
+    }
+
+    fn errorCount(self: *const Build) usize {
+        return self.diags.errorCount();
+    }
+
+    fn findLayout(self: *const Build, file: []const u8) ?usize {
+        for (self.layouts.items, 0..) |l, i| {
+            if (std.mem.eql(u8, l.file, file)) return i;
+        }
+        return null;
+    }
+
+    /// Run the pipeline. Emit and render are gated on a clean error tally so that
+    /// `check` and `build` surface the same diagnostics; `phaseRender` additionally
+    /// requires build mode (a non-null `out_dir`).
+    fn run(self: *Build) !void {
+        try self.phaseScan();
+        try self.phaseParse();
+        try self.phaseAnalyze();
+        if (self.errorCount() == 0) try self.phaseEmit();
+        if (self.out_dir != null and self.errorCount() == 0) try self.phaseRender();
+    }
+
+    /// Discover the route set and remote functions. An invalid route param is
+    /// reported as a diagnostic and the offending page skipped, so one bad route no
+    /// longer aborts the whole walk.
+    fn phaseScan(self: *Build) !void {
+        self.routes = try discoverRoutes(self.io, self.gpa, &self.diags);
+        self.remotes = try discoverRemotes(self.io, self.gpa);
+        self.advance(.init, .scanned);
+    }
+
+    /// Read and parse each route source once (stored on its `RouteNode`) and parse
+    /// every unique layout once (deduped by path, in discovery order).
+    fn phaseParse(self: *Build) !void {
+        const cwd = std.Io.Dir.cwd();
+        const nodes = try self.gpa.alloc(RouteNode, self.routes.items.len);
+        for (nodes, 0..) |*n, i| n.* = .{ .index = i };
+        self.nodes = nodes; // assign before parsing so Build.deinit reclaims it
+        for (self.nodes) |*node| {
+            const route = self.routes.items[node.index];
+            const source = try cwd.readFileAlloc(self.io, route.file, self.gpa, .limited(4 * 1024 * 1024));
+            errdefer self.gpa.free(source);
+            node.component = try parser.parse(self.gpa, source);
+            node.source = source;
+            node.parsed = true;
+        }
+        for (self.routes.items) |route| {
+            for (route.layouts) |layout| {
+                if (self.findLayout(layout.file) != null) continue;
+                const source = try cwd.readFileAlloc(self.io, layout.file, self.gpa, .limited(4 * 1024 * 1024));
+                errdefer self.gpa.free(source);
+                var component = try parser.parse(self.gpa, source);
+                errdefer parser.deinitComponent(&component, self.gpa);
+                try self.layouts.append(self.gpa, .{
+                    .file = layout.file,
+                    .source = source,
+                    .component = component,
+                    .parsed = true,
+                });
             }
         }
-        failures += validateStaticLinks(route.file, component.children, routes.items);
-        warnHtmlHygiene(route.file, component.children);
+        self.advance(.scanned, .parsed);
     }
-    failures += try validateLayouts(io, allocator, routes.items);
 
-    if (failures == 0) {
-        try prepareAssetArtifacts(io, allocator, null);
-        failures += try prepareEnvArtifacts(io, allocator, null);
-        if (failures == 0) {
-            failures += try prepareHookArtifacts(io, allocator);
-            failures += try prepareRouteArtifacts(io, allocator, routes.items);
-            failures += try runLoadTypeCheck(io, allocator, routes.items);
-            failures += try runActionTypeCheck(io, allocator, routes.items);
-            failures += try prepareRemoteArtifacts(io, allocator, remotes.items);
+    /// The dedicated semantic-analysis pass (§2): parse diagnostics, duplicate
+    /// route/remote shapes and names, layout `<slot>` cardinality, unknown static
+    /// hrefs, and HTML hygiene warnings — all emitted as source-located diagnostics.
+    fn phaseAnalyze(self: *Build) !void {
+        try validateRouteSet(&self.diags, self.routes.items);
+        try validateRemoteSet(&self.diags, self.remotes.items);
+        for (self.nodes) |*node| {
+            const route = self.routes.items[node.index];
+            try collectParseDiagnostics(&self.diags, route.file, &node.component);
+            try validateStaticLinks(&self.diags, route.file, node.component.children, self.routes.items);
+            try warnHtmlHygiene(&self.diags, route.file, node.component.children);
         }
+        for (self.layouts.items) |*layout| {
+            try collectParseDiagnostics(&self.diags, layout.file, &layout.component);
+            try validateLayoutSlots(&self.diags, layout.file, &layout.component);
+        }
+        self.advance(.parsed, .analyzed);
     }
-    return failures;
+
+    /// Generate `.yaan/*` artifacts and run the type-check backstops, preserving the
+    /// previous orchestrator's order and gating. Backstop failures (the `*_check.zig`
+    /// shims, which print their own compiler output) feed the shared error tally via
+    /// `noteExternal` rather than being re-rendered.
+    fn phaseEmit(self: *Build) !void {
+        try prepareAssetArtifacts(self.io, self.gpa, self.out_dir);
+        self.diags.noteExternal(try prepareEnvArtifacts(self.io, self.gpa, self.out_dir));
+        if (self.errorCount() == 0) {
+            self.diags.noteExternal(try prepareHookArtifacts(self.io, self.gpa));
+            self.diags.noteExternal(try prepareRouteArtifacts(self.io, self.gpa, self.routes.items, &self.diags));
+            self.diags.noteExternal(try runLoadTypeCheck(self.io, self.gpa, self.routes.items));
+            self.diags.noteExternal(try runActionTypeCheck(self.io, self.gpa, self.routes.items));
+            self.diags.noteExternal(try prepareRemoteArtifacts(self.io, self.gpa, self.remotes.items));
+        }
+        self.advance(.analyzed, .emitted);
+    }
+
+    /// Codegen the browser ESM + scoped CSS and write the prerendered documents.
+    /// Reuses the components parsed in `phaseParse` (no second parse). Only runs in
+    /// build mode after a clean emit, so its output for a valid app is unchanged.
+    fn phaseRender(self: *Build) !void {
+        const out_dir = self.out_dir.?;
+        const io = self.io;
+        const allocator = self.gpa;
+        const cwd = std.Io.Dir.cwd();
+
+        var build_routes: std.ArrayList(BuildRoute) = .empty;
+        defer {
+            for (build_routes.items) |r| {
+                var route = r.route;
+                route.deinit(allocator);
+                allocator.free(r.module);
+                for (r.layouts) |url| allocator.free(url);
+                allocator.free(r.layouts);
+            }
+            build_routes.deinit(allocator);
+        }
+        var css_bundle: std.ArrayList(u8) = .empty;
+        defer css_bundle.deinit(allocator);
+        try css_bundle.appendSlice(allocator, codegen.baseCss());
+
+        // Codegen each already-parsed, already-validated layout once, writing
+        // pages/layoutN.js in discovery order, and build a LayoutModule view for
+        // skeleton composition / route layout URLs.
+        const modules = try allocator.alloc(LayoutModule, self.layouts.items.len);
+        defer allocator.free(modules);
+        for (self.layouts.items, 0..) |*layout, i| {
+            const generated = try codegen.generateComponent(allocator, layout.file, layout.component);
+            defer {
+                allocator.free(generated.js);
+                allocator.free(generated.css);
+                allocator.free(generated.scope);
+                allocator.free(generated.prerender);
+            }
+            const module_name = try std.fmt.allocPrint(allocator, "pages/layout{d}.js", .{i});
+            defer allocator.free(module_name);
+            const module_path = try joinPath(allocator, out_dir, module_name);
+            defer allocator.free(module_path);
+            try cwd.writeFile(io, .{ .sub_path = module_path, .data = generated.js });
+            try css_bundle.appendSlice(allocator, generated.css);
+            try css_bundle.append(allocator, '\n');
+            // Allocate both owned fields before committing them together: a failure
+            // between the two must not leave `rendered` false with one field already
+            // owned, which LayoutNode.deinit would then leak.
+            const module = try std.fmt.allocPrint(allocator, "./pages/layout{d}.js", .{i});
+            errdefer allocator.free(module);
+            const skeleton = try allocator.dupe(u8, generated.prerender);
+            layout.module = module;
+            layout.skeleton = skeleton;
+            layout.rendered = true;
+            modules[i] = .{ .file = layout.file, .module = module, .skeleton = skeleton };
+        }
+
+        // Prerenderable route documents, written after the CSS bundle is hashed.
+        var prerender_docs: std.ArrayList(PrerenderDoc) = .empty;
+        defer {
+            for (prerender_docs.items) |doc| {
+                allocator.free(doc.path);
+                allocator.free(doc.skeleton);
+            }
+            prerender_docs.deinit(allocator);
+        }
+
+        for (self.nodes, 0..) |*node, page_index| {
+            const route = self.routes.items[node.index];
+            const generated = try codegen.generateComponent(allocator, route.file, node.component);
+            defer {
+                allocator.free(generated.js);
+                allocator.free(generated.css);
+                allocator.free(generated.scope);
+                allocator.free(generated.prerender);
+            }
+
+            const module_name = try std.fmt.allocPrint(allocator, "pages/page{d}.js", .{page_index});
+            defer allocator.free(module_name);
+            const module_path = try joinPath(allocator, out_dir, module_name);
+            defer allocator.free(module_path);
+            try cwd.writeFile(io, .{ .sub_path = module_path, .data = generated.js });
+            try css_bundle.appendSlice(allocator, generated.css);
+            try css_bundle.append(allocator, '\n');
+
+            if (route.options.prerender != .never) {
+                // Wrap the page skeleton with each layout's skeleton (root outermost)
+                // by substituting the slot sentinel at every level.
+                const composed = try composeSkeleton(allocator, generated.prerender, route.layouts, modules);
+                try prerender_docs.append(allocator, .{
+                    .page_index = page_index,
+                    .path = try allocator.dupe(u8, route.path),
+                    .skeleton = composed,
+                });
+            }
+
+            const layout_urls = try layoutUrlsForRoute(allocator, route.layouts, modules);
+            try build_routes.append(allocator, .{
+                .route = try cloneRoute(allocator, route),
+                .module = try std.fmt.allocPrint(allocator, "./{s}", .{module_name}),
+                .layouts = layout_urls,
+            });
+        }
+
+        const routes_json = try routesJson(allocator, build_routes.items);
+        defer allocator.free(routes_json);
+        const routes_js = try codegen.routesSource(allocator, routes_json);
+        defer allocator.free(routes_js);
+        const app_js = try codegen.appSource(allocator, routes_json);
+        defer allocator.free(app_js);
+        const remotes_js = try remotesJs(allocator, self.remotes.items);
+        defer allocator.free(remotes_js);
+
+        const runtime_path = try joinPath(allocator, out_dir, "runtime.js");
+        defer allocator.free(runtime_path);
+        const routes_path = try joinPath(allocator, out_dir, "routes.js");
+        defer allocator.free(routes_path);
+        const app_path = try joinPath(allocator, out_dir, "app.js");
+        defer allocator.free(app_path);
+        const remotes_path = try joinPath(allocator, out_dir, "remotes.js");
+        defer allocator.free(remotes_path);
+
+        try cwd.writeFile(io, .{ .sub_path = runtime_path, .data = codegen.runtimeSource() });
+        try cwd.writeFile(io, .{ .sub_path = routes_path, .data = routes_js });
+        try cwd.writeFile(io, .{ .sub_path = app_path, .data = app_js });
+        try cwd.writeFile(io, .{ .sub_path = remotes_path, .data = remotes_js });
+
+        // Content-hash the stylesheet and place it under /assets/ so it is served
+        // with immutable caching; every document links this exact href.
+        const style_hash = contentHash(css_bundle.items);
+        const style_name = try std.fmt.allocPrint(allocator, "assets/style.{s}.css", .{style_hash});
+        defer allocator.free(style_name);
+        const assets_dir = try joinPath(allocator, out_dir, "assets");
+        defer allocator.free(assets_dir);
+        try cwd.createDirPath(io, assets_dir);
+        const style_path = try joinPath(allocator, out_dir, style_name);
+        defer allocator.free(style_path);
+        try cwd.writeFile(io, .{ .sub_path = style_path, .data = css_bundle.items });
+        const stylesheet_href = try std.fmt.allocPrint(allocator, "/{s}", .{style_name});
+        defer allocator.free(stylesheet_href);
+
+        const index_path = try joinPath(allocator, out_dir, "index.html");
+        defer allocator.free(index_path);
+        const index_html = try codegen.htmlSource(allocator, .{ .stylesheet = stylesheet_href });
+        defer allocator.free(index_html);
+        try cwd.writeFile(io, .{ .sub_path = index_path, .data = index_html });
+
+        // Per-route prerendered documents + the server manifest, now that the
+        // stylesheet href is known.
+        var prerender_manifest: std.ArrayList(u8) = .empty;
+        defer prerender_manifest.deinit(allocator);
+        try prerender_manifest.append(allocator, '[');
+        for (prerender_docs.items, 0..) |doc, i| {
+            const page_html = try codegen.htmlSource(allocator, .{
+                .app_html = doc.skeleton,
+                .stylesheet = stylesheet_href,
+            });
+            defer allocator.free(page_html);
+            const html_name = try std.fmt.allocPrint(allocator, "pages/page{d}.html", .{doc.page_index});
+            defer allocator.free(html_name);
+            const html_path = try joinPath(allocator, out_dir, html_name);
+            defer allocator.free(html_path);
+            try cwd.writeFile(io, .{ .sub_path = html_path, .data = page_html });
+
+            if (i > 0) try prerender_manifest.append(allocator, ',');
+            const path_lit = try jsonString(allocator, doc.path);
+            defer allocator.free(path_lit);
+            const file_lit = try jsonString(allocator, html_name);
+            defer allocator.free(file_lit);
+            try prerender_manifest.print(allocator, "{{\"path\":{s},\"file\":{s}}}", .{ path_lit, file_lit });
+        }
+        try prerender_manifest.append(allocator, ']');
+        const prerender_path = try joinPath(allocator, out_dir, "prerender.json");
+        defer allocator.free(prerender_path);
+        try cwd.writeFile(io, .{ .sub_path = prerender_path, .data = prerender_manifest.items });
+        try writeErrorPages(io, allocator, out_dir);
+
+        self.advance(.emitted, .rendered);
+    }
+};
+
+/// Convert a component's parser diagnostics (message + byte offset) into
+/// source-located `Diagnostic`s under the `E_PARSE` code.
+fn collectParseDiagnostics(bag: *diagnostics.Bag, file: []const u8, component: *const parser.Component) !void {
+    if (component.diagnostics.len == 0) return;
+    var toks = tokenizer.Tokenizer.init(bag.allocator, component.source);
+    defer toks.deinit();
+    for (component.diagnostics) |diag| {
+        const pos = toks.position(diag.offset);
+        try bag.addf(.@"error", file, @intCast(pos.line), @intCast(pos.column), "E_PARSE", "{s}", .{diag.message});
+    }
+}
+
+/// A layout must mark exactly one `<slot>` outlet (where the child level mounts);
+/// zero or many is a build error.
+fn validateLayoutSlots(bag: *diagnostics.Bag, file: []const u8, component: *const parser.Component) !void {
+    const slots = codegen.countSlots(component.children);
+    if (slots == 0) {
+        try bag.add(.{
+            .file = file,
+            .code = "E_LAYOUT_NO_SLOT",
+            .message = "a layout must contain exactly one <slot> outlet (found none)",
+        });
+    } else if (slots > 1) {
+        try bag.addf(.@"error", file, 0, 0, "E_LAYOUT_MULTI_SLOT", "a layout must contain exactly one <slot> outlet (found {d})", .{slots});
+    }
+}
+
+/// Runs the pipeline in check mode (no `dist/` output) and returns the number of
+/// errors. Located diagnostics are printed; the `*_check.zig` backstops printed
+/// their own compiler output during the emit phase.
+pub fn checkProject(io: std.Io, allocator: std.mem.Allocator) !usize {
+    var build = Build.init(io, allocator, null);
+    defer build.deinit();
+    try build.run();
+    build.diags.flush();
+    return build.errorCount();
 }
 
 /// Guards the clean step: only relative, non-traversing output dirs are wiped,
@@ -149,6 +513,9 @@ fn isSafeOutputDir(out_dir: []const u8) bool {
     return true;
 }
 
+/// Runs the full pipeline in build mode, emitting browser assets and prerendered
+/// HTML into `out_dir`. Any diagnostics are printed and `error.CheckFailed` is
+/// returned without producing output.
 pub fn buildProject(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     // Clean the output directory so stale artifacts (old hashed assets, removed
@@ -159,212 +526,21 @@ pub fn buildProject(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
     defer allocator.free(pages_dir);
     try cwd.createDirPath(io, pages_dir);
 
-    var routes = try discoverRoutes(io, allocator);
-    defer deinitRoutes(&routes, allocator);
-    var remotes = try discoverRemotes(io, allocator);
-    defer deinitRemotes(&remotes, allocator);
-    if (validateRouteSet(routes.items) > 0) return error.CheckFailed;
-    if (validateRemoteSet(remotes.items) > 0) return error.CheckFailed;
-    try prepareAssetArtifacts(io, allocator, out_dir);
-    if (try prepareEnvArtifacts(io, allocator, out_dir) > 0) return error.CheckFailed;
-    if (try prepareHookArtifacts(io, allocator) > 0) return error.CheckFailed;
-    if (try prepareRouteArtifacts(io, allocator, routes.items) > 0) return error.CheckFailed;
-    if (try runLoadTypeCheck(io, allocator, routes.items) > 0) return error.CheckFailed;
-    if (try runActionTypeCheck(io, allocator, routes.items) > 0) return error.CheckFailed;
-    if (try prepareRemoteArtifacts(io, allocator, remotes.items) > 0) return error.CheckFailed;
-
-    var build_routes: std.ArrayList(BuildRoute) = .empty;
-    defer {
-        for (build_routes.items) |r| {
-            var route = r.route;
-            route.deinit(allocator);
-            allocator.free(r.module);
-            for (r.layouts) |url| allocator.free(url);
-            allocator.free(r.layouts);
-        }
-        build_routes.deinit(allocator);
+    var build = Build.init(io, allocator, out_dir);
+    defer build.deinit();
+    try build.run();
+    if (build.errorCount() > 0) {
+        build.diags.flush();
+        return error.CheckFailed;
     }
-    var css_bundle: std.ArrayList(u8) = .empty;
-    defer css_bundle.deinit(allocator);
-    try css_bundle.appendSlice(allocator, codegen.baseCss());
-
-    // Compile each unique layout once (deduped by source path) into its own
-    // browser module, accumulating CSS and keeping its prerender skeleton for
-    // chain composition below.
-    var layout_modules: std.ArrayList(LayoutModule) = .empty;
-    defer {
-        for (layout_modules.items) |m| {
-            allocator.free(m.module);
-            allocator.free(m.skeleton);
-        }
-        layout_modules.deinit(allocator);
-    }
-    for (routes.items) |route| {
-        for (route.layouts) |layout| {
-            if (findLayoutModule(layout_modules.items, layout.file) != null) continue;
-            const source = try cwd.readFileAlloc(io, layout.file, allocator, .limited(4 * 1024 * 1024));
-            defer allocator.free(source);
-            var component = try parser.parse(allocator, source);
-            defer parser.deinitComponent(&component, allocator);
-            if (component.diagnostics.len > 0) return error.CheckFailed;
-            if (codegen.countSlots(component.children) != 1) {
-                std.debug.print("{s}: a layout must contain exactly one <slot> outlet\n", .{layout.file});
-                return error.CheckFailed;
-            }
-            const generated = try codegen.generateComponent(allocator, layout.file, component);
-            defer {
-                allocator.free(generated.js);
-                allocator.free(generated.css);
-                allocator.free(generated.scope);
-                allocator.free(generated.prerender);
-            }
-            const module_name = try std.fmt.allocPrint(allocator, "pages/layout{d}.js", .{layout_modules.items.len});
-            const module_path = try joinPath(allocator, out_dir, module_name);
-            defer allocator.free(module_path);
-            try cwd.writeFile(io, .{ .sub_path = module_path, .data = generated.js });
-            try css_bundle.appendSlice(allocator, generated.css);
-            try css_bundle.append(allocator, '\n');
-            allocator.free(module_name);
-            try layout_modules.append(allocator, .{
-                .file = layout.file,
-                .module = try std.fmt.allocPrint(allocator, "./pages/layout{d}.js", .{layout_modules.items.len}),
-                .skeleton = try allocator.dupe(u8, generated.prerender),
-            });
-        }
-    }
-
-    // Prerenderable route documents, written after the CSS bundle is hashed.
-    var prerender_docs: std.ArrayList(PrerenderDoc) = .empty;
-    defer {
-        for (prerender_docs.items) |doc| {
-            allocator.free(doc.path);
-            allocator.free(doc.skeleton);
-        }
-        prerender_docs.deinit(allocator);
-    }
-
-    for (routes.items, 0..) |route, page_index| {
-        const source = try cwd.readFileAlloc(io, route.file, allocator, .limited(4 * 1024 * 1024));
-        var component = try parser.parse(allocator, source);
-        defer parser.deinitComponent(&component, allocator);
-        if (component.diagnostics.len > 0) return error.CheckFailed;
-        if (validateStaticLinks(route.file, component.children, routes.items) > 0) return error.CheckFailed;
-        warnHtmlHygiene(route.file, component.children);
-
-        const generated = try codegen.generateComponent(allocator, route.file, component);
-        defer {
-            allocator.free(generated.js);
-            allocator.free(generated.css);
-            allocator.free(generated.scope);
-            allocator.free(generated.prerender);
-        }
-
-        const module_name = try std.fmt.allocPrint(allocator, "pages/page{d}.js", .{page_index});
-        const module_path = try joinPath(allocator, out_dir, module_name);
-        defer allocator.free(module_path);
-        try cwd.writeFile(io, .{ .sub_path = module_path, .data = generated.js });
-        try css_bundle.appendSlice(allocator, generated.css);
-        try css_bundle.append(allocator, '\n');
-
-        if (route.options.prerender != .never) {
-            // Wrap the page skeleton with each layout's skeleton (root outermost)
-            // by substituting the slot sentinel at every level.
-            const composed = try composeSkeleton(allocator, generated.prerender, route.layouts, layout_modules.items);
-            try prerender_docs.append(allocator, .{
-                .page_index = page_index,
-                .path = try allocator.dupe(u8, route.path),
-                .skeleton = composed,
-            });
-        }
-
-        const layout_urls = try layoutUrlsForRoute(allocator, route.layouts, layout_modules.items);
-        try build_routes.append(allocator, .{
-            .route = try cloneRoute(allocator, route),
-            .module = try std.fmt.allocPrint(allocator, "./{s}", .{module_name}),
-            .layouts = layout_urls,
-        });
-    }
-
-    const routes_json = try routesJson(allocator, build_routes.items);
-    defer allocator.free(routes_json);
-    const routes_js = try codegen.routesSource(allocator, routes_json);
-    defer allocator.free(routes_js);
-    const app_js = try codegen.appSource(allocator, routes_json);
-    defer allocator.free(app_js);
-    const remotes_js = try remotesJs(allocator, remotes.items);
-    defer allocator.free(remotes_js);
-
-    const runtime_path = try joinPath(allocator, out_dir, "runtime.js");
-    defer allocator.free(runtime_path);
-    const routes_path = try joinPath(allocator, out_dir, "routes.js");
-    defer allocator.free(routes_path);
-    const app_path = try joinPath(allocator, out_dir, "app.js");
-    defer allocator.free(app_path);
-    const remotes_path = try joinPath(allocator, out_dir, "remotes.js");
-    defer allocator.free(remotes_path);
-
-    try cwd.writeFile(io, .{ .sub_path = runtime_path, .data = codegen.runtimeSource() });
-    try cwd.writeFile(io, .{ .sub_path = routes_path, .data = routes_js });
-    try cwd.writeFile(io, .{ .sub_path = app_path, .data = app_js });
-    try cwd.writeFile(io, .{ .sub_path = remotes_path, .data = remotes_js });
-
-    // Content-hash the stylesheet and place it under /assets/ so it is served
-    // with immutable caching; every document links this exact href.
-    const style_hash = contentHash(css_bundle.items);
-    const style_name = try std.fmt.allocPrint(allocator, "assets/style.{s}.css", .{style_hash});
-    defer allocator.free(style_name);
-    const assets_dir = try joinPath(allocator, out_dir, "assets");
-    defer allocator.free(assets_dir);
-    try cwd.createDirPath(io, assets_dir);
-    const style_path = try joinPath(allocator, out_dir, style_name);
-    defer allocator.free(style_path);
-    try cwd.writeFile(io, .{ .sub_path = style_path, .data = css_bundle.items });
-    const stylesheet_href = try std.fmt.allocPrint(allocator, "/{s}", .{style_name});
-    defer allocator.free(stylesheet_href);
-
-    const index_path = try joinPath(allocator, out_dir, "index.html");
-    defer allocator.free(index_path);
-    const index_html = try codegen.htmlSource(allocator, .{ .stylesheet = stylesheet_href });
-    defer allocator.free(index_html);
-    try cwd.writeFile(io, .{ .sub_path = index_path, .data = index_html });
-
-    // Per-route prerendered documents + the server manifest, now that the
-    // stylesheet href is known.
-    var prerender_manifest: std.ArrayList(u8) = .empty;
-    defer prerender_manifest.deinit(allocator);
-    try prerender_manifest.append(allocator, '[');
-    for (prerender_docs.items, 0..) |doc, i| {
-        const page_html = try codegen.htmlSource(allocator, .{
-            .app_html = doc.skeleton,
-            .stylesheet = stylesheet_href,
-        });
-        defer allocator.free(page_html);
-        const html_name = try std.fmt.allocPrint(allocator, "pages/page{d}.html", .{doc.page_index});
-        defer allocator.free(html_name);
-        const html_path = try joinPath(allocator, out_dir, html_name);
-        defer allocator.free(html_path);
-        try cwd.writeFile(io, .{ .sub_path = html_path, .data = page_html });
-
-        if (i > 0) try prerender_manifest.append(allocator, ',');
-        const path_lit = try jsonString(allocator, doc.path);
-        defer allocator.free(path_lit);
-        const file_lit = try jsonString(allocator, html_name);
-        defer allocator.free(file_lit);
-        try prerender_manifest.print(allocator, "{{\"path\":{s},\"file\":{s}}}", .{ path_lit, file_lit });
-    }
-    try prerender_manifest.append(allocator, ']');
-    const prerender_path = try joinPath(allocator, out_dir, "prerender.json");
-    defer allocator.free(prerender_path);
-    try cwd.writeFile(io, .{ .sub_path = prerender_path, .data = prerender_manifest.items });
-    try writeErrorPages(io, allocator, out_dir);
 }
 
 pub fn buildDevLoadRunner(io: std.Io, allocator: std.mem.Allocator) !void {
-    var routes = try discoverRoutes(io, allocator);
+    var routes = try discoverRoutes(io, allocator, null);
     defer deinitRoutes(&routes, allocator);
-    if (validateRouteSet(routes.items) > 0) return error.CheckFailed;
+    try devValidateRoutes(allocator, routes.items);
     if (try prepareEnvArtifacts(io, allocator, null) > 0) return error.CheckFailed;
-    if (try prepareRouteArtifacts(io, allocator, routes.items) > 0) return error.CheckFailed;
+    try devPrepareRouteArtifacts(io, allocator, routes.items);
     if (try runLoadTypeCheck(io, allocator, routes.items) > 0) return error.CheckFailed;
     if (!hasLoaders(routes.items)) return;
 
@@ -392,11 +568,11 @@ pub fn buildDevLoadRunner(io: std.Io, allocator: std.mem.Allocator) !void {
 }
 
 pub fn buildDevActionRunner(io: std.Io, allocator: std.mem.Allocator) !void {
-    var routes = try discoverRoutes(io, allocator);
+    var routes = try discoverRoutes(io, allocator, null);
     defer deinitRoutes(&routes, allocator);
-    if (validateRouteSet(routes.items) > 0) return error.CheckFailed;
+    try devValidateRoutes(allocator, routes.items);
     if (try prepareEnvArtifacts(io, allocator, null) > 0) return error.CheckFailed;
-    if (try prepareRouteArtifacts(io, allocator, routes.items) > 0) return error.CheckFailed;
+    try devPrepareRouteArtifacts(io, allocator, routes.items);
     if (try runActionTypeCheck(io, allocator, routes.items) > 0) return error.CheckFailed;
     if (!hasActions(routes.items)) return;
 
@@ -426,7 +602,7 @@ pub fn buildDevActionRunner(io: std.Io, allocator: std.mem.Allocator) !void {
 pub fn buildDevRemoteRunner(io: std.Io, allocator: std.mem.Allocator) !void {
     var remotes = try discoverRemotes(io, allocator);
     defer deinitRemotes(&remotes, allocator);
-    if (validateRemoteSet(remotes.items) > 0) return error.CheckFailed;
+    try devValidateRemotes(allocator, remotes.items);
     if (try prepareEnvArtifacts(io, allocator, null) > 0) return error.CheckFailed;
     if (try prepareRemoteArtifacts(io, allocator, remotes.items) > 0) return error.CheckFailed;
     if (remotes.items.len == 0) return;
@@ -838,7 +1014,11 @@ const PendingPage = struct {
     }
 };
 
-fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(router.RoutePattern) {
+/// Walks `src/routes`, building the sorted route set and collecting layout dirs.
+/// When `bag` is non-null (the pipeline), a page with an invalid route segment is
+/// reported as an `E_BAD_PARAM_TYPE` diagnostic and skipped so the walk continues;
+/// when null (the standalone dev runners), the first bad segment aborts as before.
+fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator, bag: ?*diagnostics.Bag) !std.ArrayList(router.RoutePattern) {
     const cwd = std.Io.Dir.cwd();
     var routes_dir = try cwd.openDir(io, "src/routes", .{ .iterate = true });
     defer routes_dir.close(io);
@@ -868,6 +1048,17 @@ fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(route
         if (!std.mem.eql(u8, entry.basename, "+page.yn")) continue;
         const src_path = try std.fmt.allocPrint(allocator, "src/routes/{s}", .{entry.path});
         const route = router.parseRouteFile(allocator, src_path) catch |err| {
+            if (bag) |b| switch (err) {
+                error.InvalidRouteParam, error.InvalidRouteRest, error.InvalidRouteGroup, error.InvalidRouteSegment => {
+                    try b.addf(.@"error", src_path, 0, 0, "E_BAD_PARAM_TYPE", "invalid route segment: {t}", .{err});
+                    allocator.free(src_path);
+                    continue;
+                },
+                else => {
+                    allocator.free(src_path);
+                    return err;
+                },
+            };
             allocator.free(src_path);
             std.debug.print("src/routes/{s}: invalid route segment: {t}\n", .{ entry.path, err });
             return err;
@@ -910,7 +1101,15 @@ fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(route
         try pages.append(allocator, .{ .route = route_with_load, .rel_dir = rel_dir });
     }
 
-    if (pages.items.len == 0) return error.NoRoutes;
+    if (pages.items.len == 0) {
+        // Every page was rejected with a diagnostic: return an empty set so the
+        // pipeline reports those instead of a bare NoRoutes error. A genuinely
+        // empty routes dir (no diagnostics) is still an error.
+        if (bag) |b| {
+            if (b.errorCount() > 0) return .empty;
+        }
+        return error.NoRoutes;
+    }
 
     // Resolve chains first (fallible; `pages` still owns each route so the defer
     // cleans up correctly on error), then move ownership into `routes` through a
@@ -983,46 +1182,6 @@ fn resolveLayoutChain(io: std.Io, allocator: std.mem.Allocator, page_rel_dir: []
 
 /// Parses each unique layout, reporting parse diagnostics and enforcing the
 /// exactly-one-`<slot>` rule. Returns the number of failures.
-fn validateLayouts(io: std.Io, allocator: std.mem.Allocator, routes: []const router.RoutePattern) !usize {
-    const cwd = std.Io.Dir.cwd();
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-    var failures: usize = 0;
-    for (routes) |route| {
-        for (route.layouts) |layout| {
-            var already = false;
-            for (seen.items) |f| {
-                if (std.mem.eql(u8, f, layout.file)) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
-            try seen.append(allocator, layout.file);
-
-            const source = try cwd.readFileAlloc(io, layout.file, allocator, .limited(4 * 1024 * 1024));
-            defer allocator.free(source);
-            var component = try parser.parse(allocator, source);
-            defer parser.deinitComponent(&component, allocator);
-            if (component.diagnostics.len > 0) {
-                failures += component.diagnostics.len;
-                for (component.diagnostics) |diag| {
-                    var toks = @import("tokenizer.zig").Tokenizer.init(allocator, source);
-                    defer toks.deinit();
-                    const pos = toks.position(diag.offset);
-                    std.debug.print("{s}:{d}:{d}: {s}\n", .{ layout.file, pos.line, pos.column, diag.message });
-                }
-            }
-            const slots = codegen.countSlots(component.children);
-            if (slots != 1) {
-                failures += 1;
-                std.debug.print("{s}: a layout must contain exactly one <slot> outlet (found {d})\n", .{ layout.file, slots });
-            }
-        }
-    }
-    return failures;
-}
-
 fn layoutApplies(layout_dir: []const u8, page_dir: []const u8) bool {
     if (layout_dir.len == 0) return true; // root layout wraps every page
     if (std.mem.eql(u8, layout_dir, page_dir)) return true;
@@ -1131,45 +1290,89 @@ fn isJsIdent(value: []const u8) bool {
     return true;
 }
 
-fn validateRemoteSet(remotes: []const RemoteFunction) usize {
-    var failures: usize = 0;
+fn validateRemoteSet(bag: *diagnostics.Bag, remotes: []const RemoteFunction) !void {
     for (remotes, 0..) |a, i| {
         for (remotes[i + 1 ..]) |b| {
             if (std.mem.eql(u8, a.name, b.name)) {
-                std.debug.print("duplicate remote function name '{s}'\n", .{a.name});
-                failures += 1;
+                try bag.addf(.@"error", b.file, 0, 0, "E_DUP_REMOTE_NAME", "duplicate remote function name '{s}'", .{a.name});
             }
         }
     }
-    return failures;
 }
 
-fn validateRouteSet(routes: []const router.RoutePattern) usize {
-    var failures: usize = 0;
-    if (router.hasDuplicateShapes(routes)) {
-        std.debug.print("duplicate route pattern detected\n", .{});
-        failures += 1;
+fn validateRouteSet(bag: *diagnostics.Bag, routes: []const router.RoutePattern) !void {
+    for (routes, 0..) |a, i| {
+        for (routes[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a.shape, b.shape)) {
+                try bag.addf(.@"error", b.file, 0, 0, "E_DUP_ROUTE_SHAPE", "duplicate route pattern (collides with {s})", .{a.file});
+            }
+        }
     }
-    if (router.hasDuplicateNames(routes)) {
-        std.debug.print("duplicate generated route name detected\n", .{});
-        failures += 1;
+    for (routes, 0..) |a, i| {
+        for (routes[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a.name, b.name)) {
+                try bag.addf(.@"error", b.file, 0, 0, "E_DUP_ROUTE_NAME", "duplicate generated route name '{s}' (collides with {s})", .{ b.name, a.file });
+            }
+        }
     }
-    return failures;
 }
 
-fn validateRouteOptions(routes: []const router.RoutePattern) usize {
-    var failures: usize = 0;
+/// Route-set check for the standalone dev runners, which compile a single runner
+/// subprocess outside the full pipeline. Prints any diagnostics and fails fast.
+fn devValidateRoutes(allocator: std.mem.Allocator, routes: []const router.RoutePattern) !void {
+    var bag = diagnostics.Bag.init(allocator);
+    defer bag.deinit();
+    try validateRouteSet(&bag, routes);
+    if (bag.errorCount() > 0) {
+        bag.flush();
+        return error.CheckFailed;
+    }
+}
+
+fn devValidateRemotes(allocator: std.mem.Allocator, remotes: []const RemoteFunction) !void {
+    var bag = diagnostics.Bag.init(allocator);
+    defer bag.deinit();
+    try validateRemoteSet(&bag, remotes);
+    if (bag.errorCount() > 0) {
+        bag.flush();
+        return error.CheckFailed;
+    }
+}
+
+/// Route-artifact build for the standalone dev runners: fails if either the
+/// options type-check backstop or the located route-option diagnostics report an
+/// error, mirroring how the full pipeline gates the same step.
+fn devPrepareRouteArtifacts(io: std.Io, allocator: std.mem.Allocator, routes: []router.RoutePattern) !void {
+    var bag = diagnostics.Bag.init(allocator);
+    defer bag.deinit();
+    const failures = try prepareRouteArtifacts(io, allocator, routes, &bag);
+    if (failures > 0 or bag.errorCount() > 0) {
+        bag.flush();
+        return error.CheckFailed;
+    }
+}
+
+/// Route-options semantic check (§2). Options are only known after the
+/// `+page.options.zig` sidecar is compiled and applied in the emit phase, so this
+/// runs there rather than in `phaseAnalyze`, emitting located diagnostics for the
+/// combinations that v1 does not support.
+fn validateRouteOptions(bag: *diagnostics.Bag, routes: []const router.RoutePattern) !void {
     for (routes) |route| {
         if (!route.options.csr) {
-            std.debug.print("{s}: csr=false requires SSR/static page output and is not supported in v1\n", .{route.file});
-            failures += 1;
+            try bag.add(.{
+                .file = route.file,
+                .code = "E_CSR_REQUIRED",
+                .message = "csr=false requires SSR/static page output and is not supported in v1",
+            });
         }
         if (route.options.prerender == .always and routeHasDynamicSegments(route)) {
-            std.debug.print("{s}: prerender=.always for dynamic routes requires static params and is not supported in v1\n", .{route.file});
-            failures += 1;
+            try bag.add(.{
+                .file = route.file,
+                .code = "E_PRERENDER_DYNAMIC",
+                .message = "prerender=.always for dynamic routes requires static params and is not supported in v1",
+            });
         }
     }
-    return failures;
 }
 
 fn routeHasDynamicSegments(route: router.RoutePattern) bool {
@@ -1179,45 +1382,42 @@ fn routeHasDynamicSegments(route: router.RoutePattern) bool {
     return false;
 }
 
-fn validateStaticLinks(file: []const u8, nodes: []const parser.Node, routes: []const router.RoutePattern) usize {
-    var failures: usize = 0;
+fn validateStaticLinks(bag: *diagnostics.Bag, file: []const u8, nodes: []const parser.Node, routes: []const router.RoutePattern) !void {
     for (nodes) |node| switch (node) {
         .element => |element| {
             for (element.attrs) |attr| {
                 if (std.mem.eql(u8, attr.name, "href")) {
                     if (attr.value) |value| {
                         if (value.len > 0 and value[0] == '/' and !router.anyRouteMatchesStaticPath(routes, value)) {
-                            std.debug.print("{s}: unknown static href '{s}'\n", .{ file, value });
-                            failures += 1;
+                            try bag.addf(.@"error", file, 0, 0, "E_UNKNOWN_STATIC_HREF", "unknown static href '{s}'", .{value});
                         }
                     }
                 }
             }
-            failures += validateStaticLinks(file, element.children, routes);
+            try validateStaticLinks(bag, file, element.children, routes);
         },
         .if_block => |block| {
-            failures += validateStaticLinks(file, block.then_children, routes);
-            failures += validateStaticLinks(file, block.else_children, routes);
+            try validateStaticLinks(bag, file, block.then_children, routes);
+            try validateStaticLinks(bag, file, block.else_children, routes);
         },
-        .each_block => |block| failures += validateStaticLinks(file, block.children, routes),
+        .each_block => |block| try validateStaticLinks(bag, file, block.children, routes),
         else => {},
     };
-    return failures;
 }
 
-fn warnHtmlHygiene(file: []const u8, nodes: []const parser.Node) void {
+fn warnHtmlHygiene(bag: *diagnostics.Bag, file: []const u8, nodes: []const parser.Node) !void {
     for (nodes) |node| switch (node) {
         .element => |element| {
             if (std.mem.eql(u8, element.name, "img") and !hasAttr(element, "alt")) {
-                std.debug.print("{s}: warning: <img> is missing alt text\n", .{file});
+                try bag.add(.{ .severity = .warning, .file = file, .code = "W_IMG_NO_ALT", .message = "<img> is missing alt text" });
             }
-            warnHtmlHygiene(file, element.children);
+            try warnHtmlHygiene(bag, file, element.children);
         },
         .if_block => |block| {
-            warnHtmlHygiene(file, block.then_children);
-            warnHtmlHygiene(file, block.else_children);
+            try warnHtmlHygiene(bag, file, block.then_children);
+            try warnHtmlHygiene(bag, file, block.else_children);
         },
-        .each_block => |block| warnHtmlHygiene(file, block.children),
+        .each_block => |block| try warnHtmlHygiene(bag, file, block.children),
         else => {},
     };
 }
@@ -1659,12 +1859,15 @@ fn appendJsValue(allocator: std.mem.Allocator, out: *std.ArrayList(u8), kind: En
     }
 }
 
-fn prepareRouteArtifacts(io: std.Io, allocator: std.mem.Allocator, routes: []router.RoutePattern) !usize {
+/// Returns the number of options *type-check* failures (an external backstop that
+/// prints its own compiler output); v1-unsupported option combinations are emitted
+/// into `bag` as located diagnostics instead.
+fn prepareRouteArtifacts(io: std.Io, allocator: std.mem.Allocator, routes: []router.RoutePattern, bag: *diagnostics.Bag) !usize {
     try writeTypedRoutes(io, allocator, routes);
-    var failures = try runOptionsTypeCheck(io, allocator, routes);
+    const failures = try runOptionsTypeCheck(io, allocator, routes);
     if (failures == 0) {
         try applyRouteOptions(io, allocator, routes);
-        failures += validateRouteOptions(routes);
+        try validateRouteOptions(bag, routes);
     }
     try writeTypedRoutes(io, allocator, routes);
     return failures;
@@ -3404,6 +3607,186 @@ fn joinPath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
 test "check source fails malformed input" {
     const result = try checkSource(std.testing.allocator, "bad.yn", "<p>{oops</p>");
     try std.testing.expect(!result.ok);
+}
+
+test "collectParseDiagnostics locates parser errors under E_PARSE" {
+    const allocator = std.testing.allocator;
+    var component = try parser.parse(allocator, "<p>{oops</p>");
+    defer parser.deinitComponent(&component, allocator);
+    try std.testing.expect(component.diagnostics.len > 0);
+
+    var bag = diagnostics.Bag.init(allocator);
+    defer bag.deinit();
+    try collectParseDiagnostics(&bag, "src/routes/+page.yn", &component);
+
+    try std.testing.expectEqual(@as(usize, component.diagnostics.len), bag.errorCount());
+    try std.testing.expectEqualStrings("E_PARSE", bag.items.items[0].code);
+    try std.testing.expectEqualStrings("src/routes/+page.yn", bag.items.items[0].file);
+    try std.testing.expect(bag.items.items[0].line >= 1);
+}
+
+test "validateStaticLinks flags unknown hrefs, hygiene warns on missing alt" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\<a href="/missing">broken</a>
+        \\<img src="/logo.svg" />
+        \\<img src="/ok.svg" alt="ok" />
+    ;
+    var component = try parser.parse(allocator, source);
+    defer parser.deinitComponent(&component, allocator);
+    try std.testing.expectEqual(@as(usize, 0), component.diagnostics.len);
+
+    var bag = diagnostics.Bag.init(allocator);
+    defer bag.deinit();
+    // No routes exist, so the leading-slash href is unresolvable.
+    try validateStaticLinks(&bag, "src/routes/+page.yn", component.children, &.{});
+    try warnHtmlHygiene(&bag, "src/routes/+page.yn", component.children);
+
+    // One error (unknown static href) and one warning (the alt-less <img>).
+    try std.testing.expectEqual(@as(usize, 1), bag.errorCount());
+    try std.testing.expectEqual(@as(usize, 1), bag.warningCount());
+}
+
+// Minimal RoutePattern fixture: only the fields the route-set/options validators
+// read are meaningful; the rest are dummies that are never freed (nothing is
+// allocated, so no deinit is needed).
+fn fixtureRoute(file: []const u8, shape: []const u8, name: []const u8, segments: []router.Segment, options: router.RouteOptions) router.RoutePattern {
+    return .{
+        .file = @constCast(file),
+        .path = @constCast("/x"),
+        .shape = @constCast(shape),
+        .name = @constCast(name),
+        .groups = &.{},
+        .segments = segments,
+        .score = 0,
+        .options = options,
+    };
+}
+
+test "validateRouteSet flags duplicate shapes (against the colliding file)" {
+    const a = std.testing.allocator;
+    var no_segs = [_]router.Segment{};
+    const routes = [_]router.RoutePattern{
+        fixtureRoute("src/routes/a/+page.yn", "/dup", "a", &no_segs, .{}),
+        fixtureRoute("src/routes/b/+page.yn", "/dup", "b", &no_segs, .{}),
+    };
+    var bag = diagnostics.Bag.init(a);
+    defer bag.deinit();
+    try validateRouteSet(&bag, &routes);
+    try std.testing.expectEqual(@as(usize, 1), bag.errorCount());
+    try std.testing.expectEqualStrings("E_DUP_ROUTE_SHAPE", bag.items.items[0].code);
+    try std.testing.expectEqualStrings("src/routes/b/+page.yn", bag.items.items[0].file);
+}
+
+test "validateRouteSet flags duplicate generated names" {
+    const a = std.testing.allocator;
+    var no_segs = [_]router.Segment{};
+    const routes = [_]router.RoutePattern{
+        fixtureRoute("src/routes/a/+page.yn", "/x", "dup", &no_segs, .{}),
+        fixtureRoute("src/routes/b/+page.yn", "/y", "dup", &no_segs, .{}),
+    };
+    var bag = diagnostics.Bag.init(a);
+    defer bag.deinit();
+    try validateRouteSet(&bag, &routes);
+    try std.testing.expectEqual(@as(usize, 1), bag.errorCount());
+    try std.testing.expectEqualStrings("E_DUP_ROUTE_NAME", bag.items.items[0].code);
+}
+
+test "validateRemoteSet flags duplicate remote names" {
+    const a = std.testing.allocator;
+    const remotes = [_]RemoteFunction{
+        .{ .file = @constCast("src/remotes/a.remote.zig"), .name = @constCast("getUser") },
+        .{ .file = @constCast("src/remotes/b.remote.zig"), .name = @constCast("getUser") },
+    };
+    var bag = diagnostics.Bag.init(a);
+    defer bag.deinit();
+    try validateRemoteSet(&bag, &remotes);
+    try std.testing.expectEqual(@as(usize, 1), bag.errorCount());
+    try std.testing.expectEqualStrings("E_DUP_REMOTE_NAME", bag.items.items[0].code);
+}
+
+test "validateRouteOptions rejects v1-unsupported option combos" {
+    const a = std.testing.allocator;
+    var no_segs = [_]router.Segment{};
+    var dyn_segs = [_]router.Segment{.{ .kind = .dynamic, .name = @constCast("id") }};
+    const routes = [_]router.RoutePattern{
+        fixtureRoute("src/routes/a/+page.yn", "/a", "a", &no_segs, .{ .csr = false }),
+        fixtureRoute("src/routes/b/+page.yn", "/b/[id]", "b", &dyn_segs, .{ .prerender = .always }),
+    };
+    var bag = diagnostics.Bag.init(a);
+    defer bag.deinit();
+    try validateRouteOptions(&bag, &routes);
+    try std.testing.expectEqual(@as(usize, 2), bag.errorCount());
+    bag.sort(); // deterministic order by file: a before b
+    try std.testing.expectEqualStrings("E_CSR_REQUIRED", bag.items.items[0].code);
+    try std.testing.expectEqualStrings("E_PRERENDER_DYNAMIC", bag.items.items[1].code);
+}
+
+test "validateLayoutSlots requires exactly one slot outlet" {
+    const a = std.testing.allocator;
+
+    var none = try parser.parse(a, "<div>no outlet</div>");
+    defer parser.deinitComponent(&none, a);
+    var bag0 = diagnostics.Bag.init(a);
+    defer bag0.deinit();
+    try validateLayoutSlots(&bag0, "src/routes/+layout.yn", &none);
+    try std.testing.expectEqual(@as(usize, 1), bag0.errorCount());
+    try std.testing.expectEqualStrings("E_LAYOUT_NO_SLOT", bag0.items.items[0].code);
+
+    var one = try parser.parse(a, "<main><slot></slot></main>");
+    defer parser.deinitComponent(&one, a);
+    var bag1 = diagnostics.Bag.init(a);
+    defer bag1.deinit();
+    try validateLayoutSlots(&bag1, "src/routes/+layout.yn", &one);
+    try std.testing.expectEqual(@as(usize, 0), bag1.errorCount());
+
+    var two = try parser.parse(a, "<div><slot></slot><slot></slot></div>");
+    defer parser.deinitComponent(&two, a);
+    var bag2 = diagnostics.Bag.init(a);
+    defer bag2.deinit();
+    try validateLayoutSlots(&bag2, "src/routes/+layout.yn", &two);
+    try std.testing.expectEqual(@as(usize, 1), bag2.errorCount());
+    try std.testing.expectEqualStrings("E_LAYOUT_MULTI_SLOT", bag2.items.items[0].code);
+}
+
+// End-to-end negative path: an on-disk app whose only route declares an unknown
+// param type. This drives the real pipeline (filesystem walk → scan → parse →
+// analyze) and proves both that the bad param surfaces as E_BAD_PARAM_TYPE and
+// that a route error gates emit/render — the one diagnostic the pure-helper unit
+// tests above can't reach.
+test "pipeline emits E_BAD_PARAM_TYPE and gates emit/render on a bad route param" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Isolated app fixture: parseRouteFile rejects "[id:bogus]" from the path
+    // alone, so the +page.yn contents are irrelevant.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src/routes/[id:bogus]");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/routes/[id:bogus]/+page.yn", .data = "<h1>x</h1>" });
+
+    // cwd is process-global; capture the original through a real fd and restore
+    // it (cwd() yields AT_FDCWD, which fchdir ignores — open "." for a real fd).
+    var orig = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer orig.close(io);
+    const tmp_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(tmp_path);
+    try std.Io.Threaded.chdir(tmp_path);
+    defer std.Io.Threaded.fchdir(orig.handle) catch {};
+
+    // Build mode (out_dir set) so a clean gate proves render is skipped too.
+    var build = Build.init(io, a, "dist");
+    defer build.deinit();
+    try build.run();
+
+    try std.testing.expect(build.errorCount() > 0);
+    var found = false;
+    for (build.diags.items.items) |d| {
+        if (std.mem.eql(u8, d.code, "E_BAD_PARAM_TYPE")) found = true;
+    }
+    try std.testing.expect(found);
+    // Emit and render never ran: the build never advanced past analyze.
+    try std.testing.expectEqual(Stage.analyzed, build.stage);
 }
 
 test "layout chain resolution follows directory nesting" {

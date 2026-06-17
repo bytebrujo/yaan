@@ -267,6 +267,31 @@ pub fn build(b: *std.Build) void {
     if (read_timeout_ms) |value| dev_cmd.addArgs(&.{ "--read-timeout-ms", value });
     dev_step.dependOn(&dev_cmd.step);
 
+    const start_step = b.step("start", "Serve a production build with the Yaan server (run `app-build` first)");
+    const start_cmd = b.addRunArtifact(exe);
+    start_cmd.step.dependOn(b.getInstallStep());
+    start_cmd.setCwd(b.path(app_root));
+    start_cmd.addArgs(&.{ "start", "--host", dev_host, "--port", dev_port });
+    if (otel_endpoint) |endpoint| {
+        start_cmd.addArgs(&.{ "--otel-endpoint", endpoint, "--otel-service", otel_service });
+    }
+    // `start` is production-safe by default; pass `yaan start --debug-errors`
+    // directly for verbose local error pages.
+    if (trusted_proxy) |value| start_cmd.addArgs(&.{ "--trusted-proxy", value });
+    if (force_https) start_cmd.addArg("--force-https");
+    if (hsts) start_cmd.addArg("--hsts");
+    start_cmd.addArgs(&.{ "--hsts-max-age", hsts_max_age });
+    if (csrf) start_cmd.addArg("--csrf");
+    if (cookie_secret) |value| start_cmd.addArgs(&.{ "--cookie-secret", value });
+    if (max_body) |value| start_cmd.addArgs(&.{ "--max-body", value });
+    if (max_upload_file) |value| start_cmd.addArgs(&.{ "--max-upload-file", value });
+    if (max_upload_count) |value| start_cmd.addArgs(&.{ "--max-upload-count", value });
+    if (max_form_fields) |value| start_cmd.addArgs(&.{ "--max-form-fields", value });
+    if (max_multipart_header) |value| start_cmd.addArgs(&.{ "--max-multipart-header", value });
+    if (max_headers) |value| start_cmd.addArgs(&.{ "--max-headers", value });
+    if (read_timeout_ms) |value| start_cmd.addArgs(&.{ "--read-timeout-ms", value });
+    start_step.dependOn(&start_cmd.step);
+
     const lib_tests = b.addTest(.{ .root_module = mod });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 

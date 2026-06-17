@@ -660,6 +660,9 @@ fn writeProjectBuildFiles(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
             \\    const dev = b.step("dev", "Run the Yaan dev server");
             \\    dev.dependOn(&b.addSystemCommand(&.{ "yaan", "dev", "--host", host, "--port", port }).step);
             \\
+            \\    const start = b.step("start", "Serve a production build (run `yaan build` first)");
+            \\    start.dependOn(&b.addSystemCommand(&.{ "yaan", "start", "--host", host, "--port", port }).step);
+            \\
             \\    const check = b.step("check", "Run Yaan framework checks");
             \\    check.dependOn(&b.addSystemCommand(&.{ "yaan", "check" }).step);
             \\

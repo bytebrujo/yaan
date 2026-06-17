@@ -7,6 +7,8 @@ var upload_counter: usize = 0;
 pub const StaticServerOptions = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5173,
+    /// Prefix for the startup log line (e.g. "yaan dev" vs "yaan").
+    label: []const u8 = "yaan dev",
     root: []const u8 = "dist",
     hook_runner: []const u8 = ".yaan/hook_runner",
     /// In-process hook seam. When set, the request runs this composable layer
@@ -110,7 +112,7 @@ pub fn serve(io: std.Io, allocator: std.mem.Allocator, options: StaticServerOpti
     }
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    std.debug.print("yaan dev listening on http://{s}:{d}\n", .{ options.host, options.port });
+    std.debug.print("{s} listening on http://{s}:{d}\n", .{ options.label, options.host, options.port });
 
     while (true) {
         var stream = try listener.accept(io);

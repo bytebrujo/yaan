@@ -28,6 +28,20 @@ yaan dev           # build and serve; no build.zig dependency needed for the dev
 `build.zig`/`build.zig.zon` wrap the CLI so `zig build dev` works too, but the
 `yaan` binary alone is enough to develop, check, and build an app.
 
+For production, build once and serve the output:
+
+```sh
+yaan build         # optimized output into dist/
+yaan start         # serve dist/ with production-safe error pages
+```
+
+`yaan start` mirrors `yaan dev` but does not rebuild `dist/` and defaults to
+production-safe errors (pass `--debug-errors` for verbose local pages). It
+accepts the same security/observability flags as `dev` (`--force-https`,
+`--hsts`, `--csrf`, `--trusted-proxy`, `--otel-endpoint`, …). For the
+linked-in, no-subprocess deployment artifact, see the in-process server
+(`zig build dev-inproc`) below.
+
 V1 is intentionally small: browser SPA output only, opaque JavaScript in
 `<script>`, keyed and index-based `{#each}`, component-scoped CSS, and no Node
 toolchain requirement.

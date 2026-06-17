@@ -36,6 +36,7 @@ cd examples/app
 zig build check        # framework-aware checks (type-checks loaders/actions/remotes/hooks)
 zig build test         # app tests through the in-process Yaan harness
 zig build dev          # dev server, subprocess runner model (default)
+zig build start        # serve a prior `yaan build` (production-safe errors)
 zig build dev-inproc   # in-process server: handlers linked in, no runner subprocesses
 ```
 

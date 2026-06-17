@@ -75,6 +75,29 @@ pub fn build(b: *std.Build) void {
     if (read_timeout_ms) |value| dev_cmd.addArgs(&.{ "--read-timeout-ms", value });
     dev_step.dependOn(&dev_cmd.step);
 
+    // Serve a prior `yaan build` with production-safe defaults (subprocess
+    // runners). For the linked-in deploy artifact, use `dev-inproc` below.
+    const start_step = b.step("start", "Serve a production build (run `build-app` first)");
+    const start_cmd = b.addRunArtifact(yaan_exe);
+    start_cmd.addArgs(&.{ "start", "--host", dev_host, "--port", dev_port });
+    if (otel_endpoint) |endpoint| {
+        start_cmd.addArgs(&.{ "--otel-endpoint", endpoint, "--otel-service", otel_service });
+    }
+    if (trusted_proxy) |value| start_cmd.addArgs(&.{ "--trusted-proxy", value });
+    if (force_https) start_cmd.addArg("--force-https");
+    if (hsts) start_cmd.addArg("--hsts");
+    start_cmd.addArgs(&.{ "--hsts-max-age", hsts_max_age });
+    if (csrf) start_cmd.addArg("--csrf");
+    if (cookie_secret) |value| start_cmd.addArgs(&.{ "--cookie-secret", value });
+    if (max_body) |value| start_cmd.addArgs(&.{ "--max-body", value });
+    if (max_upload_file) |value| start_cmd.addArgs(&.{ "--max-upload-file", value });
+    if (max_upload_count) |value| start_cmd.addArgs(&.{ "--max-upload-count", value });
+    if (max_form_fields) |value| start_cmd.addArgs(&.{ "--max-form-fields", value });
+    if (max_multipart_header) |value| start_cmd.addArgs(&.{ "--max-multipart-header", value });
+    if (max_headers) |value| start_cmd.addArgs(&.{ "--max-headers", value });
+    if (read_timeout_ms) |value| start_cmd.addArgs(&.{ "--read-timeout-ms", value });
+    start_step.dependOn(&start_cmd.step);
+
     // In-process server: handlers linked into the binary, no runner subprocesses.
     // The whole module graph is discovered and wired by the framework.
     const app_server = yaan.addInProcessServer(b, .{

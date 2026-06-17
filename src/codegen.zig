@@ -2,6 +2,11 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const css = @import("css.zig");
 
+/// Marker emitted in a layout's prerender skeleton where the child level's
+/// skeleton is substituted at build time. Kept as an HTML comment so an
+/// uncomposed skeleton is still valid markup.
+pub const slot_sentinel = "<!--yaan-slot-->";
+
 pub const GeneratedComponent = struct {
     js: []u8,
     css: []u8,
@@ -46,6 +51,9 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
     // create(): build the component from scratch (no prerendered DOM).
     try out.appendSlice(allocator, "\nexport function create(target, props = {}) {\n");
     try out.appendSlice(allocator, "  const disposers = [];\n");
+    // Layout outlet: set by a <slot> element, null for pages. The router mounts
+    // the child level into this element; pages leave it null.
+    try out.appendSlice(allocator, "  let __yaan_slot = null;\n");
     if (script.body.len > 0) {
         try out.appendSlice(allocator, script.body);
         try out.append(allocator, '\n');
@@ -55,6 +63,7 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
     try out.appendSlice(allocator,
         \\  return {
         \\    snapshot: typeof snapshot !== 'undefined' ? snapshot : null,
+        \\    slot: __yaan_slot,
         \\    destroy() { for (const dispose of disposers.splice(0)) dispose(); clear(target); }
         \\  };
         \\
@@ -64,6 +73,7 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
     // hydrate(): adopt the prerendered skeleton in #app, attaching events/effects.
     try out.appendSlice(allocator, "\nexport function hydrate(target, props = {}) {\n");
     try out.appendSlice(allocator, "  const disposers = [];\n");
+    try out.appendSlice(allocator, "  let __yaan_slot = null;\n");
     if (script.body.len > 0) {
         try out.appendSlice(allocator, script.body);
         try out.append(allocator, '\n');
@@ -76,6 +86,7 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
     try out.appendSlice(allocator,
         \\  return {
         \\    snapshot: typeof snapshot !== 'undefined' ? snapshot : null,
+        \\    slot: __yaan_slot,
         \\    destroy() { for (const dispose of disposers.splice(0)) dispose(); clear(target); }
         \\  };
         \\
@@ -315,7 +326,16 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\
         \\const outlet = document.getElementById('app');
         \\const live = document.getElementById('yaan-live');
-        \\let current = null;
+        \\// The mounted layout/page chain, outermost (layout) to innermost (page).
+        \\// currentChainUrls mirrors it by module URL and currentChainData by the
+        \\// serialized data each level was mounted with, so navigation keeps a layout
+        \\// mounted only while BOTH its module and its data are unchanged.
+        \\let currentChain = [];
+        \\let currentChainUrls = [];
+        \\let currentChainData = [];
+        \\let currentRoute = null;
+        \\function activePage() { return currentChain.length ? currentChain[currentChain.length - 1] : null; }
+        \\function stringifyData(value) { return value === undefined ? undefined : JSON.stringify(value); }
         \\let formResult = null;
         \\let activeHistoryKey = null;
         \\let canHydrate = outlet ? outlet.dataset.yaanPrerendered === 'true' : false;
@@ -369,7 +389,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\
         \\function captureSnapshot(key = activeHistoryKey) {
         \\  writeScroll(key);
-        \\  const snapshot = current?.snapshot;
+        \\  const snapshot = activePage()?.snapshot;
         \\  if (!snapshot || typeof snapshot.capture !== 'function') return;
         \\  try {
         \\    writeSnapshot(key, snapshot.capture());
@@ -379,7 +399,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\}
         \\
         \\function restoreSnapshot(key = activeHistoryKey) {
-        \\  const snapshot = current?.snapshot;
+        \\  const snapshot = activePage()?.snapshot;
         \\  if (!snapshot || typeof snapshot.restore !== 'function') return;
         \\  const value = readSnapshot(key);
         \\  if (value === undefined) return;
@@ -423,11 +443,15 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  return Promise.resolve().then(mutate);
         \\}
         \\const prefetched = new Set();
+        \\function routeChainUrls(route) { return [...(route.layouts || []), route.module]; }
         \\function prefetchRoute(pathname) {
         \\  const found = match(pathname);
-        \\  if (!found || prefetched.has(found.route.module)) return;
-        \\  prefetched.add(found.route.module);
-        \\  import(found.route.module).catch(() => prefetched.delete(found.route.module));
+        \\  if (!found) return;
+        \\  for (const url of routeChainUrls(found.route)) {
+        \\    if (prefetched.has(url)) continue;
+        \\    prefetched.add(url);
+        \\    import(url).catch(() => prefetched.delete(url));
+        \\  }
         \\}
         \\function escapeRe(value) {
         \\  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -462,6 +486,10 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  }
         \\  return null;
         \\}
+        \\function destroyChainFrom(index) {
+        \\  for (let i = currentChain.length - 1; i >= index; i--) currentChain[i].destroy();
+        \\  currentChain.length = Math.min(currentChain.length, index);
+        \\}
         \\async function render(options = {}) {
         \\  const restore = options.restoreSnapshot !== false;
         \\  const animate = options.animate === true;
@@ -469,8 +497,10 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  const found = match(location.pathname);
         \\  if (!found) {
         \\    await swap(() => {
-        \\      if (current) current.destroy();
-        \\      current = null;
+        \\      destroyChainFrom(0);
+        \\      currentChainUrls = [];
+        \\      currentChainData = [];
+        \\      currentRoute = null;
         \\      outlet.replaceChildren();
         \\      outlet.textContent = '404';
         \\    }, animate);
@@ -480,24 +510,61 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\    focusOutlet();
         \\    return;
         \\  }
-        \\  const [data, mod] = await Promise.all([
+        \\  const chainUrls = routeChainUrls(found.route);
+        \\  const [loaded, mods] = await Promise.all([
         \\    fetch('/_yaan/load?path=' + encodeURIComponent(location.pathname)).then(r => r.json()).catch(() => found.params),
-        \\    import(found.route.module),
+        \\    Promise.all(chainUrls.map(url => import(url))),
         \\  ]);
-        \\  const props = { params: found.params, data, form: formResult };
-        \\  const hydrateNow = canHydrate && typeof mod.hydrate === 'function' && outlet.childNodes.length > 0;
+        \\  // Layout loads compose into an envelope; a plain page payload has no layers.
+        \\  let pageData = loaded, layerData = [];
+        \\  if (loaded && loaded.__yaan_chain) { pageData = loaded.data; layerData = loaded.layouts || []; }
+        \\  const hydrateNow = canHydrate && outlet.childNodes.length > 0 && mods.every(m => typeof m.hydrate === 'function');
         \\  canHydrate = false;
         \\  await swap(() => {
-        \\    if (hydrateNow) {
-        \\      current = mod.hydrate(outlet, props);
-        \\    } else {
-        \\      if (current) current.destroy();
-        \\      current = null;
-        \\      outlet.replaceChildren();
-        \\      current = mod.create(outlet, props);
+        \\    // Keep the shared prefix of LAYOUTS that match by both module URL and
+        \\    // data; rebuild from the first divergent level. The page (last level)
+        \\    // always rebuilds since its params/data/form vary every navigation.
+        \\    let common = 0;
+        \\    if (!hydrateNow) {
+        \\      const keepMax = chainUrls.length - 1; // never persist the page itself
+        \\      while (common < keepMax && common < currentChainUrls.length
+        \\             && currentChainUrls[common] === chainUrls[common]
+        \\             && currentChainData[common] === stringifyData(layerData[common])) common++;
         \\    }
+        \\    destroyChainFrom(common);
+        \\    if (common === 0 && !hydrateNow) outlet.replaceChildren();
+        \\    let built = common;
+        \\    try {
+        \\      let parent = common === 0 ? outlet : currentChain[common - 1].slot;
+        \\      for (let i = common; i < chainUrls.length; i++) {
+        \\        const isPage = i === chainUrls.length - 1;
+        \\        const levelData = isPage ? pageData : layerData[i];
+        \\        const props = { params: found.params, data: levelData, form: isPage ? formResult : null };
+        \\        const mod = mods[i];
+        \\        const inst = (hydrateNow && typeof mod.hydrate === 'function') ? mod.hydrate(parent, props) : mod.create(parent, props);
+        \\        currentChain[i] = inst;
+        \\        currentChainData[i] = stringifyData(levelData);
+        \\        built = i + 1;
+        \\        parent = inst.slot;
+        \\        if (!parent && !isPage) break; // malformed layout (no <slot>); build-time guarded
+        \\      }
+        \\    } catch (error) {
+        \\      // Never leave a partially-built chain: tear down and reset so the next
+        \\      // navigation rebuilds from scratch instead of diffing against a hole.
+        \\      currentChain.length = built;
+        \\      destroyChainFrom(0);
+        \\      currentChainUrls = [];
+        \\      currentChainData = [];
+        \\      currentRoute = null;
+        \\      throw error;
+        \\    }
+        \\    // `built` (not chainUrls.length) so an early break leaves no undefined holes.
+        \\    currentChain.length = built;
+        \\    currentChainData.length = built;
+        \\    currentChainUrls = chainUrls;
+        \\    currentRoute = found.route;
         \\  }, animate && !hydrateNow);
-        \\  applyTitle(found.route, data);
+        \\  applyTitle(found.route, pageData);
         \\  if (options.focus !== false) focusOutlet();
         \\  if (options.scroll === 'restore') {
         \\    const pos = readScroll(activeHistoryKey);
@@ -735,6 +802,7 @@ pub fn escapeHtml(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 pub fn baseCss() []const u8 {
     return
         \\.yaan-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
+        \\slot{display:contents;}
         \\@media (prefers-reduced-motion: reduce){::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none !important;}}
         \\
     ;
@@ -754,11 +822,51 @@ fn emitNodes(allocator: std.mem.Allocator, out: *std.ArrayList(u8), ctx: *EmitCo
                 try out.print(allocator, "{s}const {s} = text({s}, ({s}));\n", .{ indent, name, parent, expr });
                 try out.print(allocator, "{s}disposers.push($effect(() => {s}.update(({s}))));\n", .{ indent, name, expr });
             },
-            .element => |elem| try emitElement(allocator, out, ctx, elem, parent, scope, indent, name),
+            .element => |elem| if (isSlot(elem.name))
+                try emitSlot(allocator, out, parent, scope, indent, name)
+            else
+                try emitElement(allocator, out, ctx, elem, parent, scope, indent, name),
             .if_block => |ifb| try emitIf(allocator, out, ctx, ifb, parent, scope, indent, name),
             .each_block => |each| try emitEach(allocator, out, ctx, each, parent, scope, indent, name),
         }
     }
+}
+
+/// A layout's `<slot>` becomes the outlet the router mounts the child level
+/// into. We emit a real `<slot>` element (styled `display:contents` so it adds
+/// no box) and record it in `__yaan_slot`; the component never mounts its own
+/// child — the router owns chain composition so it can keep parent layouts
+/// mounted across navigation.
+fn emitSlot(allocator: std.mem.Allocator, out: *std.ArrayList(u8), parent: []const u8, scope: []const u8, indent: []const u8, name: []const u8) anyerror!void {
+    const scope_name = try jsString(allocator, scope);
+    defer allocator.free(scope_name);
+    try out.print(allocator, "{s}const {s} = document.createElement('slot');\n", .{ indent, name });
+    try out.print(allocator, "{s}{s}.setAttribute({s}, '');\n", .{ indent, name, scope_name });
+    try out.print(allocator, "{s}mount({s}, {s});\n", .{ indent, parent, name });
+    try out.print(allocator, "{s}__yaan_slot = {s};\n", .{ indent, name });
+}
+
+fn isSlot(name: []const u8) bool {
+    return std.mem.eql(u8, name, "slot");
+}
+
+/// Counts `<slot>` elements anywhere in a component tree. Layouts require
+/// exactly one; pages require zero.
+pub fn countSlots(nodes: []const parser.Node) usize {
+    var total: usize = 0;
+    for (nodes) |node| switch (node) {
+        .element => |elem| {
+            if (isSlot(elem.name)) total += 1;
+            total += countSlots(elem.children);
+        },
+        .if_block => |ifb| {
+            total += countSlots(ifb.then_children);
+            total += countSlots(ifb.else_children);
+        },
+        .each_block => |each| total += countSlots(each.children),
+        else => {},
+    };
+    return total;
 }
 
 fn emitElement(allocator: std.mem.Allocator, out: *std.ArrayList(u8), ctx: *EmitContext, elem: parser.Element, parent: []const u8, scope: []const u8, indent: []const u8, name: []const u8) anyerror!void {
@@ -852,7 +960,10 @@ fn emitHydrateNodes(allocator: std.mem.Allocator, out: *std.ArrayList(u8), ctx: 
                 try out.print(allocator, "{s}const {s} = hydrateInterp({s}, ({s}));\n", .{ indent, name, cursor, expr });
                 try out.print(allocator, "{s}disposers.push($effect(() => {s}.update(({s}))));\n", .{ indent, name, expr });
             },
-            .element => |elem| try emitHydrateElement(allocator, out, ctx, elem, cursor, scope, indent, name),
+            .element => |elem| if (isSlot(elem.name))
+                try emitHydrateSlot(allocator, out, cursor, scope, indent, name)
+            else
+                try emitHydrateElement(allocator, out, ctx, elem, cursor, scope, indent, name),
             .if_block => |ifb| try emitHydrateIf(allocator, out, ctx, ifb, cursor, scope, indent, name),
             .each_block => |each| try emitHydrateEach(allocator, out, ctx, each, cursor, scope, indent, name),
         }
@@ -873,6 +984,17 @@ fn emitHydrateElement(allocator: std.mem.Allocator, out: *std.ArrayList(u8), ctx
         try out.print(allocator, "{s}const {s} = hydrateCursor({s});\n", .{ indent, child_cursor, name });
         try emitHydrateNodes(allocator, out, ctx, elem.children, child_cursor, scope, indent);
     }
+}
+
+/// Adopts the prerendered `<slot>` element but deliberately does NOT recurse
+/// into its children: the child level's prerendered DOM lives inside the slot
+/// and is hydrated by the router calling that level's own hydrate().
+fn emitHydrateSlot(allocator: std.mem.Allocator, out: *std.ArrayList(u8), cursor: []const u8, scope: []const u8, indent: []const u8, name: []const u8) anyerror!void {
+    const scope_name = try jsString(allocator, scope);
+    defer allocator.free(scope_name);
+    try out.print(allocator, "{s}const {s} = hydrateElement({s}, 'slot');\n", .{ indent, name, cursor });
+    try out.print(allocator, "{s}{s}.setAttribute({s}, '');\n", .{ indent, name, scope_name });
+    try out.print(allocator, "{s}__yaan_slot = {s};\n", .{ indent, name });
 }
 
 fn emitHydrateIf(allocator: std.mem.Allocator, out: *std.ArrayList(u8), ctx: *EmitContext, ifb: parser.IfBlock, cursor: []const u8, scope: []const u8, indent: []const u8, name: []const u8) anyerror!void {
@@ -919,7 +1041,12 @@ fn prerenderNodes(allocator: std.mem.Allocator, out: *std.ArrayList(u8), nodes: 
                 try out.appendSlice(allocator, escaped);
             },
             .interpolation => {},
-            .element => |elem| try prerenderElement(allocator, out, elem, scope),
+            .element => |elem| if (isSlot(elem.name))
+                // The sentinel comment is replaced with the child level's
+                // composed skeleton at build time (project.composeSkeleton).
+                try out.print(allocator, "<slot {s}=\"\">{s}</slot>", .{ scope, slot_sentinel })
+            else
+                try prerenderElement(allocator, out, elem, scope),
             .if_block => try out.appendSlice(allocator, "<!--if-->"),
             .each_block => try out.appendSlice(allocator, "<!--each-->"),
         }
@@ -1076,5 +1203,40 @@ test "app router adopts modern navigation, a11y and performance patterns" {
     // P2.3 prefetch on intent
     try std.testing.expect(std.mem.indexOf(u8, app, "function prefetchRoute(") != null);
     // P2.2 hydration hook
-    try std.testing.expect(std.mem.indexOf(u8, app, "mod.hydrate(outlet, props)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "mod.hydrate(parent, props)") != null);
+    // Layout chain: shared prefix kept, divergent tail rebuilt.
+    try std.testing.expect(std.mem.indexOf(u8, app, "routeChainUrls(found.route)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "currentChainUrls[common] === chainUrls[common]") != null);
+    // Data-aware persistence: a layout is kept only while its data is unchanged,
+    // and the page (last level) always rebuilds.
+    try std.testing.expect(std.mem.indexOf(u8, app, "currentChainData[common] === stringifyData(layerData[common])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "const keepMax = chainUrls.length - 1") != null);
+}
+
+test "layout slot codegen exposes an outlet the page does not" {
+    var layout = try parser.parse(std.testing.allocator,
+        \\<div class="shell"><header>nav</header><slot></slot></div>
+    );
+    defer parser.deinitComponent(&layout, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), countSlots(layout.children));
+    const generated = try generateComponent(std.testing.allocator, "src/routes/+layout.yn", layout);
+    defer {
+        std.testing.allocator.free(generated.js);
+        std.testing.allocator.free(generated.css);
+        std.testing.allocator.free(generated.scope);
+        std.testing.allocator.free(generated.prerender);
+    }
+    // create()/hydrate() build the slot element and surface it as the outlet.
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "document.createElement('slot')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "__yaan_slot = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "slot: __yaan_slot,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "hydrateElement(") != null);
+    // Prerender carries the slot element with the child-substitution sentinel.
+    try std.testing.expect(std.mem.indexOf(u8, generated.prerender, slot_sentinel) != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.prerender, "<slot ") != null);
+
+    // A page has no slot, so its outlet stays null.
+    var page = try parser.parse(std.testing.allocator, "<main><h1>hi</h1></main>");
+    defer parser.deinitComponent(&page, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), countSlots(page.children));
 }

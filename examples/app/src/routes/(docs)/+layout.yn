@@ -1,0 +1,13 @@
+<style>
+.docs-shell { display: grid; grid-template-columns: 12rem 1fr; gap: 1.5rem; padding: 1rem; }
+.docs-shell nav { display: flex; flex-direction: column; gap: 0.5rem; }
+.docs-shell nav a { color: #1f6feb; text-decoration: none; }
+</style>
+
+<div class="docs-shell">
+  <nav>
+    <a href="/docs/intro/setup">Setup</a>
+    <a href="/docs/guide/routing">Routing</a>
+  </nav>
+  <article><slot></slot></article>
+</div>

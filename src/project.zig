@@ -13,6 +13,17 @@ pub const CheckResult = struct {
 const BuildRoute = struct {
     route: router.RoutePattern,
     module: []u8,
+    /// Browser module URLs for this route's layout chain (outermost first).
+    layouts: [][]u8 = &.{},
+};
+
+/// A deduplicated layout compiled once and shared by every route whose chain
+/// includes it. Sharing one module URL per layout file is what lets the client
+/// router keep a parent layout mounted across sibling navigations.
+const LayoutModule = struct {
+    file: []const u8, // borrowed from the owning route's LayoutRef
+    module: []u8, // "./pages/layoutN.js"
+    skeleton: []u8, // prerender skeleton (carries the slot sentinel)
 };
 
 /// A prerenderable route whose HTML document is written after the CSS bundle is
@@ -112,6 +123,7 @@ pub fn checkProject(io: std.Io, allocator: std.mem.Allocator) !usize {
         failures += validateStaticLinks(route.file, component.children, routes.items);
         warnHtmlHygiene(route.file, component.children);
     }
+    failures += try validateLayouts(io, allocator, routes.items);
 
     if (failures == 0) {
         try prepareAssetArtifacts(io, allocator, null);
@@ -167,12 +179,59 @@ pub fn buildProject(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
             var route = r.route;
             route.deinit(allocator);
             allocator.free(r.module);
+            for (r.layouts) |url| allocator.free(url);
+            allocator.free(r.layouts);
         }
         build_routes.deinit(allocator);
     }
     var css_bundle: std.ArrayList(u8) = .empty;
     defer css_bundle.deinit(allocator);
     try css_bundle.appendSlice(allocator, codegen.baseCss());
+
+    // Compile each unique layout once (deduped by source path) into its own
+    // browser module, accumulating CSS and keeping its prerender skeleton for
+    // chain composition below.
+    var layout_modules: std.ArrayList(LayoutModule) = .empty;
+    defer {
+        for (layout_modules.items) |m| {
+            allocator.free(m.module);
+            allocator.free(m.skeleton);
+        }
+        layout_modules.deinit(allocator);
+    }
+    for (routes.items) |route| {
+        for (route.layouts) |layout| {
+            if (findLayoutModule(layout_modules.items, layout.file) != null) continue;
+            const source = try cwd.readFileAlloc(io, layout.file, allocator, .limited(4 * 1024 * 1024));
+            defer allocator.free(source);
+            var component = try parser.parse(allocator, source);
+            defer parser.deinitComponent(&component, allocator);
+            if (component.diagnostics.len > 0) return error.CheckFailed;
+            if (codegen.countSlots(component.children) != 1) {
+                std.debug.print("{s}: a layout must contain exactly one <slot> outlet\n", .{layout.file});
+                return error.CheckFailed;
+            }
+            const generated = try codegen.generateComponent(allocator, layout.file, component);
+            defer {
+                allocator.free(generated.js);
+                allocator.free(generated.css);
+                allocator.free(generated.scope);
+                allocator.free(generated.prerender);
+            }
+            const module_name = try std.fmt.allocPrint(allocator, "pages/layout{d}.js", .{layout_modules.items.len});
+            const module_path = try joinPath(allocator, out_dir, module_name);
+            defer allocator.free(module_path);
+            try cwd.writeFile(io, .{ .sub_path = module_path, .data = generated.js });
+            try css_bundle.appendSlice(allocator, generated.css);
+            try css_bundle.append(allocator, '\n');
+            allocator.free(module_name);
+            try layout_modules.append(allocator, .{
+                .file = layout.file,
+                .module = try std.fmt.allocPrint(allocator, "./pages/layout{d}.js", .{layout_modules.items.len}),
+                .skeleton = try allocator.dupe(u8, generated.prerender),
+            });
+        }
+    }
 
     // Prerenderable route documents, written after the CSS bundle is hashed.
     var prerender_docs: std.ArrayList(PrerenderDoc) = .empty;
@@ -208,16 +267,21 @@ pub fn buildProject(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u
         try css_bundle.append(allocator, '\n');
 
         if (route.options.prerender != .never) {
+            // Wrap the page skeleton with each layout's skeleton (root outermost)
+            // by substituting the slot sentinel at every level.
+            const composed = try composeSkeleton(allocator, generated.prerender, route.layouts, layout_modules.items);
             try prerender_docs.append(allocator, .{
                 .page_index = page_index,
                 .path = try allocator.dupe(u8, route.path),
-                .skeleton = try allocator.dupe(u8, generated.prerender),
+                .skeleton = composed,
             });
         }
 
+        const layout_urls = try layoutUrlsForRoute(allocator, route.layouts, layout_modules.items);
         try build_routes.append(allocator, .{
             .route = try cloneRoute(allocator, route),
             .module = try std.fmt.allocPrint(allocator, "./{s}", .{module_name}),
+            .layouts = layout_urls,
         });
     }
 
@@ -500,6 +564,46 @@ pub fn writeExampleApp(io: std.Io, allocator: std.mem.Allocator, project_name: ?
         \\    return hooks.pass();
         \\}
     });
+    // Root layout: wraps every page. The <slot> is where the matched page (or a
+    // nested layout) is mounted; props.data comes from +layout.load.zig.
+    try cwd.writeFile(io, .{ .sub_path = "src/routes/+layout.yn", .data =
+        \\<script>
+        \\import { PUBLIC_SITE_NAME } from '/env.public.js';
+        \\
+        \\const data = props.data || {};
+        \\</script>
+        \\
+        \\<style>
+        \\header { display: flex; gap: 1rem; padding: 0.5rem 1rem; border-bottom: 1px solid #d0d7de; }
+        \\header a { color: #1f6feb; text-decoration: none; }
+        \\footer { padding: 1rem; color: #57606a; border-top: 1px solid #d0d7de; }
+        \\</style>
+        \\
+        \\<header>
+        \\  <strong>{PUBLIC_SITE_NAME}</strong>
+        \\  <a href="/">Home</a>
+        \\  <a href="/blog/hello">Blog</a>
+        \\</header>
+        \\<slot></slot>
+        \\<footer>{data.framework} — © {data.year}</footer>
+    });
+    try cwd.writeFile(io, .{ .sub_path = "src/routes/+layout.load.zig", .data =
+        \\const std = @import("std");
+        \\
+        \\// Data for the root layout, available on every route. Layout loaders are
+        \\// generic over the request context (`ctx: anytype`) because one layout
+        \\// wraps many routes; use `ctx.allocator` / `ctx.request` as needed.
+        \\pub const Data = struct {
+        \\    framework: []const u8,
+        \\    year: u16,
+        \\};
+        \\
+        \\pub fn load(ctx: anytype) !Data {
+        \\    _ = ctx;
+        \\    return .{ .framework = "Yaan", .year = 2026 };
+        \\}
+        \\
+    });
     try cwd.writeFile(io, .{ .sub_path = "src/routes/+page.yn", .data =
         \\<script>
         \\import { greeting } from '/remotes.js';
@@ -721,18 +825,47 @@ fn packageName(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+/// A discovered page before its layout chain is resolved. `rel_dir` is the
+/// page's directory relative to `src/routes` ("" for the root page), used to
+/// match against discovered layout directories.
+const PendingPage = struct {
+    route: router.RoutePattern,
+    rel_dir: []u8,
+
+    fn deinit(self: *PendingPage, allocator: std.mem.Allocator) void {
+        self.route.deinit(allocator);
+        allocator.free(self.rel_dir);
+    }
+};
+
 fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(router.RoutePattern) {
     const cwd = std.Io.Dir.cwd();
     var routes_dir = try cwd.openDir(io, "src/routes", .{ .iterate = true });
     defer routes_dir.close(io);
 
-    var routes: std.ArrayList(router.RoutePattern) = .empty;
-    errdefer deinitRoutes(&routes, allocator);
+    // Pages and layout directories are collected in one walk (which yields
+    // entries in arbitrary order), then chains are resolved once both are known.
+    var pages: std.ArrayList(PendingPage) = .empty;
+    defer {
+        for (pages.items) |*page| page.deinit(allocator);
+        pages.deinit(allocator);
+    }
+    var layout_dirs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (layout_dirs.items) |dir| allocator.free(dir);
+        layout_dirs.deinit(allocator);
+    }
 
     var walker = try routes_dir.walk(allocator);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, "+page.yn")) continue;
+        if (entry.kind != .file) continue;
+        if (std.mem.eql(u8, entry.basename, "+layout.yn")) {
+            const dir = std.fs.path.dirname(entry.path) orelse "";
+            try layout_dirs.append(allocator, try allocator.dupe(u8, dir));
+            continue;
+        }
+        if (!std.mem.eql(u8, entry.basename, "+page.yn")) continue;
         const src_path = try std.fmt.allocPrint(allocator, "src/routes/{s}", .{entry.path});
         const route = router.parseRouteFile(allocator, src_path) catch |err| {
             allocator.free(src_path);
@@ -740,6 +873,7 @@ fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(route
             return err;
         };
         var route_with_load = route;
+        errdefer route_with_load.deinit(allocator);
         const load_path = try loadPathFromPage(allocator, src_path);
         if (cwd.access(io, load_path, .{ .read = true })) {
             route_with_load.load_file = load_path;
@@ -771,12 +905,157 @@ fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(route
             },
         }
         allocator.free(src_path);
-        try routes.append(allocator, route_with_load);
+        const rel_dir = try allocator.dupe(u8, std.fs.path.dirname(entry.path) orelse "");
+        errdefer allocator.free(rel_dir);
+        try pages.append(allocator, .{ .route = route_with_load, .rel_dir = rel_dir });
     }
 
-    if (routes.items.len == 0) return error.NoRoutes;
+    if (pages.items.len == 0) return error.NoRoutes;
+
+    // Resolve chains first (fallible; `pages` still owns each route so the defer
+    // cleans up correctly on error), then move ownership into `routes` through a
+    // preallocated, infallible loop so there is no double-free window.
+    for (pages.items) |*page| {
+        page.route.layouts = try resolveLayoutChain(io, allocator, page.rel_dir, layout_dirs.items);
+    }
+    var routes: std.ArrayList(router.RoutePattern) = .empty;
+    errdefer deinitRoutes(&routes, allocator);
+    try routes.ensureTotalCapacity(allocator, pages.items.len);
+    for (pages.items) |*page| {
+        routes.appendAssumeCapacity(page.route);
+        allocator.free(page.rel_dir);
+    }
+    pages.clearRetainingCapacity(); // ownership moved; skip the per-page defer
+
     router.sortRoutes(routes.items);
     return routes;
+}
+
+/// Builds the layout chain for a page: every discovered layout whose directory
+/// is an ancestor of (or equal to) the page's directory, ordered outermost
+/// (root) to innermost.
+fn resolveLayoutChain(io: std.Io, allocator: std.mem.Allocator, page_rel_dir: []const u8, layout_dirs: []const []const u8) ![]router.LayoutRef {
+    const cwd = std.Io.Dir.cwd();
+    var applicable: std.ArrayList([]const u8) = .empty;
+    defer applicable.deinit(allocator);
+    for (layout_dirs) |dir| {
+        if (layoutApplies(dir, page_rel_dir)) try applicable.append(allocator, dir);
+    }
+    std.mem.sort([]const u8, applicable.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return dirDepth(a) < dirDepth(b);
+        }
+    }.lessThan);
+
+    const refs = try allocator.alloc(router.LayoutRef, applicable.items.len);
+    var len: usize = 0;
+    errdefer {
+        for (refs[0..len]) |*ref| ref.deinit(allocator);
+        allocator.free(refs);
+    }
+    for (applicable.items) |dir| {
+        const file = if (dir.len == 0)
+            try allocator.dupe(u8, "src/routes/+layout.yn")
+        else
+            try std.fmt.allocPrint(allocator, "src/routes/{s}/+layout.yn", .{dir});
+        errdefer allocator.free(file);
+        const load_candidate = if (dir.len == 0)
+            try allocator.dupe(u8, "src/routes/+layout.load.zig")
+        else
+            try std.fmt.allocPrint(allocator, "src/routes/{s}/+layout.load.zig", .{dir});
+        var load_file: ?[]u8 = null;
+        if (cwd.access(io, load_candidate, .{ .read = true })) {
+            load_file = load_candidate;
+        } else |err| switch (err) {
+            error.FileNotFound => allocator.free(load_candidate),
+            else => {
+                allocator.free(load_candidate);
+                return err;
+            },
+        }
+        errdefer if (load_file) |lf| allocator.free(lf);
+        const name = try layoutName(allocator, dir);
+        refs[len] = .{ .file = file, .load_file = load_file, .name = name };
+        len += 1;
+    }
+    return refs;
+}
+
+/// Parses each unique layout, reporting parse diagnostics and enforcing the
+/// exactly-one-`<slot>` rule. Returns the number of failures.
+fn validateLayouts(io: std.Io, allocator: std.mem.Allocator, routes: []const router.RoutePattern) !usize {
+    const cwd = std.Io.Dir.cwd();
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    var failures: usize = 0;
+    for (routes) |route| {
+        for (route.layouts) |layout| {
+            var already = false;
+            for (seen.items) |f| {
+                if (std.mem.eql(u8, f, layout.file)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            try seen.append(allocator, layout.file);
+
+            const source = try cwd.readFileAlloc(io, layout.file, allocator, .limited(4 * 1024 * 1024));
+            defer allocator.free(source);
+            var component = try parser.parse(allocator, source);
+            defer parser.deinitComponent(&component, allocator);
+            if (component.diagnostics.len > 0) {
+                failures += component.diagnostics.len;
+                for (component.diagnostics) |diag| {
+                    var toks = @import("tokenizer.zig").Tokenizer.init(allocator, source);
+                    defer toks.deinit();
+                    const pos = toks.position(diag.offset);
+                    std.debug.print("{s}:{d}:{d}: {s}\n", .{ layout.file, pos.line, pos.column, diag.message });
+                }
+            }
+            const slots = codegen.countSlots(component.children);
+            if (slots != 1) {
+                failures += 1;
+                std.debug.print("{s}: a layout must contain exactly one <slot> outlet (found {d})\n", .{ layout.file, slots });
+            }
+        }
+    }
+    return failures;
+}
+
+fn layoutApplies(layout_dir: []const u8, page_dir: []const u8) bool {
+    if (layout_dir.len == 0) return true; // root layout wraps every page
+    if (std.mem.eql(u8, layout_dir, page_dir)) return true;
+    return page_dir.len > layout_dir.len and
+        std.mem.startsWith(u8, page_dir, layout_dir) and
+        page_dir[layout_dir.len] == '/';
+}
+
+fn dirDepth(dir: []const u8) usize {
+    if (dir.len == 0) return 0;
+    var depth: usize = 1;
+    for (dir) |c| {
+        if (c == '/') depth += 1;
+    }
+    return depth;
+}
+
+fn layoutName(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
+    if (dir.len == 0) return allocator.dupe(u8, "root");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var last_sep = false;
+    for (dir) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+        if (ok) {
+            try out.append(allocator, c);
+            last_sep = false;
+        } else if (!last_sep) {
+            try out.append(allocator, '_');
+            last_sep = true;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn loadPathFromPage(allocator: std.mem.Allocator, page_path: []const u8) ![]u8 {
@@ -2727,6 +3006,12 @@ fn appendLoadModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]con
             try argv.append(allocator, try std.fmt.allocPrint(allocator, "load_{s}", .{route.name}));
         }
     }
+    const layout_loads = try router.collectLayoutLoads(allocator, routes);
+    defer router.freeLayoutLoads(allocator, layout_loads);
+    for (layout_loads) |entry| {
+        try argv.append(allocator, "--dep");
+        try argv.append(allocator, try allocator.dupe(u8, entry.name));
+    }
     try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mroot={s}", .{root}));
     try argv.append(allocator, "--dep");
     try argv.append(allocator, "database");
@@ -2739,17 +3024,30 @@ fn appendLoadModuleArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]con
 
     for (routes) |route| {
         if (route.load_file) |load_file| {
-            try argv.append(allocator, "--dep");
-            try argv.append(allocator, "routes");
-            try argv.append(allocator, "--dep");
-            try argv.append(allocator, "env");
-            try argv.append(allocator, "--dep");
-            try argv.append(allocator, "database");
-            try argv.append(allocator, "--dep");
-            try argv.append(allocator, "assets");
-            try argv.append(allocator, try std.fmt.allocPrint(allocator, "-Mload_{s}={s}", .{ route.name, load_file }));
+            try appendLoadHandlerModule(allocator, argv, route.name, load_file, "load_");
         }
     }
+    for (layout_loads) |entry| {
+        try appendLoadHandlerModuleNamed(allocator, argv, entry.name, entry.file);
+    }
+}
+
+/// Wires one load-handler module (route loaders) with its standard deps.
+fn appendLoadHandlerModule(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), name: []const u8, file: []const u8, prefix: []const u8) !void {
+    const module_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
+    try appendLoadHandlerModuleNamed(allocator, argv, module_name, file);
+}
+
+fn appendLoadHandlerModuleNamed(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), module_name: []const u8, file: []const u8) !void {
+    try argv.append(allocator, "--dep");
+    try argv.append(allocator, "routes");
+    try argv.append(allocator, "--dep");
+    try argv.append(allocator, "env");
+    try argv.append(allocator, "--dep");
+    try argv.append(allocator, "database");
+    try argv.append(allocator, "--dep");
+    try argv.append(allocator, "assets");
+    try argv.append(allocator, try std.fmt.allocPrint(allocator, "-M{s}={s}", .{ module_name, file }));
 }
 
 fn cloneRoute(allocator: std.mem.Allocator, route: router.RoutePattern) !router.RoutePattern {
@@ -2778,6 +3076,22 @@ fn cloneRoute(allocator: std.mem.Allocator, route: router.RoutePattern) !router.
         };
         segments_len += 1;
     }
+
+    var layouts = try allocator.alloc(router.LayoutRef, route.layouts.len);
+    var layouts_len: usize = 0;
+    errdefer {
+        for (layouts[0..layouts_len]) |*layout| layout.deinit(allocator);
+        allocator.free(layouts);
+    }
+    for (route.layouts, 0..) |layout, i| {
+        layouts[i] = .{
+            .file = try allocator.dupe(u8, layout.file),
+            .load_file = if (layout.load_file) |lf| try allocator.dupe(u8, lf) else null,
+            .name = try allocator.dupe(u8, layout.name),
+        };
+        layouts_len += 1;
+    }
+
     return .{
         .file = try allocator.dupe(u8, route.file),
         .load_file = if (route.load_file) |load_file| try allocator.dupe(u8, load_file) else null,
@@ -2790,6 +3104,7 @@ fn cloneRoute(allocator: std.mem.Allocator, route: router.RoutePattern) !router.
         .groups = groups,
         .segments = segments,
         .score = route.score,
+        .layouts = layouts,
     };
 }
 
@@ -2802,7 +3117,9 @@ fn routesJson(allocator: std.mem.Allocator, routes: []const BuildRoute) ![]u8 {
         defer allocator.free(path_lit);
         const module_lit = try jsonString(allocator, route.module);
         defer allocator.free(module_lit);
-        try out.print(allocator, "{{\"path\":{s},\"module\":{s},\"groups\":", .{ path_lit, module_lit });
+        try out.print(allocator, "{{\"path\":{s},\"module\":{s},\"layouts\":", .{ path_lit, module_lit });
+        try appendStringsJson(allocator, &out, route.layouts);
+        try out.appendSlice(allocator, ",\"groups\":");
         try appendGroupsJson(allocator, &out, route.route.groups);
         try out.appendSlice(allocator, ",\"options\":");
         try appendOptionsJson(allocator, &out, route.route.options);
@@ -2810,6 +3127,68 @@ fn routesJson(allocator: std.mem.Allocator, routes: []const BuildRoute) ![]u8 {
     }
     try out.append(allocator, ']');
     return out.toOwnedSlice(allocator);
+}
+
+fn findLayoutModule(modules: []const LayoutModule, file: []const u8) ?usize {
+    for (modules, 0..) |m, i| {
+        if (std.mem.eql(u8, m.file, file)) return i;
+    }
+    return null;
+}
+
+/// Browser module URLs for a route's layout chain, outermost first.
+fn layoutUrlsForRoute(allocator: std.mem.Allocator, layouts: []const router.LayoutRef, modules: []const LayoutModule) ![][]u8 {
+    const urls = try allocator.alloc([]u8, layouts.len);
+    var len: usize = 0;
+    errdefer {
+        for (urls[0..len]) |url| allocator.free(url);
+        allocator.free(urls);
+    }
+    for (layouts) |layout| {
+        const idx = findLayoutModule(modules, layout.file) orelse return error.UnknownLayout;
+        urls[len] = try allocator.dupe(u8, modules[idx].module);
+        len += 1;
+    }
+    return urls;
+}
+
+/// Folds the page skeleton into its layout chain, innermost-out: each layout's
+/// skeleton has its slot sentinel replaced with the already-composed inner HTML,
+/// ending with the root layout outermost.
+fn composeSkeleton(allocator: std.mem.Allocator, page_skeleton: []const u8, layouts: []const router.LayoutRef, modules: []const LayoutModule) ![]u8 {
+    var current = try allocator.dupe(u8, page_skeleton);
+    var i = layouts.len;
+    while (i > 0) {
+        i -= 1;
+        const idx = findLayoutModule(modules, layouts[i].file) orelse return error.UnknownLayout;
+        const wrapped = try replaceFirst(allocator, modules[idx].skeleton, codegen.slot_sentinel, current);
+        allocator.free(current);
+        current = wrapped;
+    }
+    return current;
+}
+
+/// Returns `haystack` with the first occurrence of `needle` replaced by
+/// `replacement`. If `needle` is absent, returns a copy of `haystack`.
+fn replaceFirst(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    const at = std.mem.indexOf(u8, haystack, needle) orelse return allocator.dupe(u8, haystack);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, haystack[0..at]);
+    try out.appendSlice(allocator, replacement);
+    try out.appendSlice(allocator, haystack[at + needle.len ..]);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendStringsJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), values: []const []u8) !void {
+    try out.append(allocator, '[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try out.append(allocator, ',');
+        const lit = try jsonString(allocator, value);
+        defer allocator.free(lit);
+        try out.appendSlice(allocator, lit);
+    }
+    try out.append(allocator, ']');
 }
 
 fn remotesJs(allocator: std.mem.Allocator, remotes: []const RemoteFunction) ![]u8 {
@@ -3025,6 +3404,60 @@ fn joinPath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
 test "check source fails malformed input" {
     const result = try checkSource(std.testing.allocator, "bad.yn", "<p>{oops</p>");
     try std.testing.expect(!result.ok);
+}
+
+test "layout chain resolution follows directory nesting" {
+    const a = std.testing.allocator;
+    const dirs = [_][]const u8{ "", "(docs)", "blog" };
+    // Root layout wraps every page, in outermost-first order.
+    try std.testing.expect(layoutApplies("", "blog/x"));
+    try std.testing.expect(layoutApplies("blog", "blog/x"));
+    try std.testing.expect(!layoutApplies("blog", "blogger/x")); // prefix must be a path boundary
+    try std.testing.expect(layoutApplies("(docs)", "(docs)/docs/intro"));
+    _ = dirs;
+    try std.testing.expectEqual(@as(usize, 0), dirDepth(""));
+    try std.testing.expectEqual(@as(usize, 2), dirDepth("(docs)/docs"));
+    const name = try layoutName(a, "(docs)/docs");
+    defer a.free(name);
+    try std.testing.expectEqualStrings("_docs_docs", name);
+}
+
+test "skeleton composition nests layouts outermost-first" {
+    const a = std.testing.allocator;
+    const modules = [_]LayoutModule{
+        .{ .file = "src/routes/+layout.yn", .module = @constCast("./pages/layout0.js"), .skeleton = @constCast("<root>" ++ codegen.slot_sentinel ++ "</root>") },
+        .{ .file = "src/routes/(docs)/+layout.yn", .module = @constCast("./pages/layout1.js"), .skeleton = @constCast("<docs>" ++ codegen.slot_sentinel ++ "</docs>") },
+    };
+    const layouts = [_]router.LayoutRef{
+        .{ .file = @constCast("src/routes/+layout.yn"), .name = @constCast("root") },
+        .{ .file = @constCast("src/routes/(docs)/+layout.yn"), .name = @constCast("_docs") },
+    };
+    const composed = try composeSkeleton(a, "<page/>", &layouts, &modules);
+    defer a.free(composed);
+    try std.testing.expectEqualStrings("<root><docs><page/></docs></root>", composed);
+
+    const urls = try layoutUrlsForRoute(a, &layouts, &modules);
+    defer {
+        for (urls) |u| a.free(u);
+        a.free(urls);
+    }
+    try std.testing.expectEqualStrings("./pages/layout0.js", urls[0]);
+    try std.testing.expectEqualStrings("./pages/layout1.js", urls[1]);
+}
+
+test "routesJson includes the layout chain" {
+    const a = std.testing.allocator;
+    var route = try router.parseRouteFile(a, "src/routes/+page.yn");
+    defer route.deinit(a);
+    var layout_urls = [_][]u8{@constCast("./pages/layout0.js")};
+    const build_routes = [_]BuildRoute{.{
+        .route = route,
+        .module = @constCast("./pages/page0.js"),
+        .layouts = &layout_urls,
+    }};
+    const json = try routesJson(a, &build_routes);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"layouts\":[\"./pages/layout0.js\"]") != null);
 }
 
 test "asset manifest helpers emit hashed assets" {

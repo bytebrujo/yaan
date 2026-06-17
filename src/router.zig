@@ -31,6 +31,22 @@ pub const RouteOptions = struct {
     trailing_slash: TrailingSlash = .ignore,
 };
 
+/// One layout level in a route's chain. `file` is the `+layout.yn` source;
+/// `load_file` is its optional `+layout.load.zig` data loader. `name` is a
+/// stable, unique identifier (derived from the layout's directory + a dedup
+/// index) used to name generated modules.
+pub const LayoutRef = struct {
+    file: []u8,
+    load_file: ?[]u8 = null,
+    name: []u8,
+
+    pub fn deinit(self: *LayoutRef, allocator: std.mem.Allocator) void {
+        allocator.free(self.file);
+        if (self.load_file) |load_file| allocator.free(load_file);
+        allocator.free(self.name);
+    }
+};
+
 pub const RoutePattern = struct {
     file: []u8,
     load_file: ?[]u8 = null,
@@ -43,6 +59,9 @@ pub const RoutePattern = struct {
     groups: [][]u8,
     segments: []Segment,
     score: usize,
+    /// Layout chain wrapping this page, outermost (root) to innermost. Resolved
+    /// by discovery from the filesystem; empty for a route with no layouts.
+    layouts: []LayoutRef = &.{},
 
     pub fn deinit(self: *RoutePattern, allocator: std.mem.Allocator) void {
         allocator.free(self.file);
@@ -56,6 +75,8 @@ pub const RoutePattern = struct {
         allocator.free(self.groups);
         for (self.segments) |segment| allocator.free(segment.name);
         allocator.free(self.segments);
+        for (self.layouts) |*layout| layout.deinit(allocator);
+        allocator.free(self.layouts);
     }
 };
 
@@ -574,6 +595,71 @@ pub fn generateZigRoutes(allocator: std.mem.Allocator, routes: []const RoutePatt
     return out.toOwnedSlice(allocator);
 }
 
+/// A unique `+layout.load.zig` and its generated module name. The name is a
+/// pure function of the file path (hash-based) so the runner codegen, the
+/// subprocess build wiring, and the in-process `build.zig` all agree on it
+/// without sharing any ordering or state.
+pub const LayoutLoadEntry = struct {
+    file: []const u8,
+    name: []u8,
+};
+
+/// Module/import name for a layout loader, derived solely from its file path.
+pub fn layoutLoadName(allocator: std.mem.Allocator, file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "layout_load_{x}", .{std.hash.Wyhash.hash(0, file)});
+}
+
+/// The deduplicated, deterministically-ordered set of layout loaders across all
+/// routes. Caller owns the returned slice and each entry's `name`.
+pub fn collectLayoutLoads(allocator: std.mem.Allocator, routes: []const RoutePattern) ![]LayoutLoadEntry {
+    var list: std.ArrayList(LayoutLoadEntry) = .empty;
+    errdefer {
+        for (list.items) |entry| allocator.free(entry.name);
+        list.deinit(allocator);
+    }
+    for (routes) |route| {
+        for (route.layouts) |layout| {
+            const file = layout.load_file orelse continue;
+            var seen = false;
+            for (list.items) |entry| {
+                if (std.mem.eql(u8, entry.file, file)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            try list.append(allocator, .{ .file = file, .name = try layoutLoadName(allocator, file) });
+        }
+    }
+    std.mem.sort(LayoutLoadEntry, list.items, {}, struct {
+        fn lessThan(_: void, a: LayoutLoadEntry, b: LayoutLoadEntry) bool {
+            return std.mem.lessThan(u8, a.file, b.file);
+        }
+    }.lessThan);
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn freeLayoutLoads(allocator: std.mem.Allocator, entries: []LayoutLoadEntry) void {
+    for (entries) |entry| allocator.free(entry.name);
+    allocator.free(entries);
+}
+
+fn routeHasLayoutLoad(route: RoutePattern) bool {
+    for (route.layouts) |layout| {
+        if (layout.load_file != null) return true;
+    }
+    return false;
+}
+
+fn firstRouteUsingLayout(routes: []const RoutePattern, file: []const u8) ?RoutePattern {
+    for (routes) |route| {
+        for (route.layouts) |layout| {
+            if (std.mem.eql(u8, layout.file, file)) return route;
+        }
+    }
+    return null;
+}
+
 pub fn generateLoadCheck(allocator: std.mem.Allocator, routes: []const RoutePattern) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(allocator,
@@ -585,6 +671,11 @@ pub fn generateLoadCheck(allocator: std.mem.Allocator, routes: []const RoutePatt
         if (route.load_file != null) {
             try out.print(allocator, "const load_{s} = @import(\"load_{s}\");\n", .{ route.name, route.name });
         }
+    }
+    const layout_loads = try collectLayoutLoads(allocator, routes);
+    defer freeLayoutLoads(allocator, layout_loads);
+    for (layout_loads) |entry| {
+        try out.print(allocator, "const {s} = @import(\"{s}\");\n", .{ entry.name, entry.name });
     }
     try out.appendSlice(allocator,
         \\
@@ -609,8 +700,36 @@ pub fn generateLoadCheck(allocator: std.mem.Allocator, routes: []const RoutePatt
             load_index += 1;
         }
     }
+    // Layout loaders are generic over the context; type-check each against a
+    // representative route from its chain.
+    for (layout_loads, 0..) |entry, i| {
+        const rep = firstRouteUsingLayout(routes, layoutFileForLoad(routes, entry.file)) orelse continue;
+        try out.print(allocator,
+            \\    const lctx_{d} = routes.LoadContext(.{s}){{ .allocator = allocator, .params =
+        , .{ i, rep.name });
+        try writeParamsLiteral(allocator, &out, rep);
+        try out.print(allocator,
+            \\, .request = request }};
+            \\    const ldata_{d} = try {s}.load(lctx_{d});
+            \\    _ = ldata_{d};
+            \\
+        , .{ i, entry.name, i, i });
+    }
     try out.appendSlice(allocator, "}\n");
     return out.toOwnedSlice(allocator);
+}
+
+/// The layout component file whose `+layout.load.zig` is `load_file`, so we can
+/// find a representative route via its `.file` field.
+fn layoutFileForLoad(routes: []const RoutePattern, load_file: []const u8) []const u8 {
+    for (routes) |route| {
+        for (route.layouts) |layout| {
+            if (layout.load_file) |lf| {
+                if (std.mem.eql(u8, lf, load_file)) return layout.file;
+            }
+        }
+    }
+    return load_file;
 }
 
 pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePattern) ![]u8 {
@@ -624,6 +743,11 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
         if (route.load_file != null) {
             try out.print(allocator, "const load_{s} = @import(\"load_{s}\");\n", .{ route.name, route.name });
         }
+    }
+    const layout_loads = try collectLayoutLoads(allocator, routes);
+    defer freeLayoutLoads(allocator, layout_loads);
+    for (layout_loads) |entry| {
+        try out.print(allocator, "const {s} = @import(\"{s}\");\n", .{ entry.name, entry.name });
     }
     try out.appendSlice(allocator,
         \\
@@ -649,39 +773,65 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
         \\
     );
     for (routes) |route| {
-        if (route.load_file != null) {
-            if (paramCount(route) == 0) {
+        const has_page_load = route.load_file != null;
+        const has_layout_load = routeHasLayoutLoad(route);
+        const has_params = paramCount(route) > 0;
+
+        if (!has_layout_load) {
+            // No layout data: emit the plain page payload exactly as before.
+            if (has_page_load) {
+                try writeLoadArmHeader(allocator, &out, route, has_params);
                 try out.print(allocator,
-                    \\        .{s} => {{
-                    \\            const ctx = routes.LoadContext(.{s}){{ .allocator = allocator, .params = .{{}}
-                , .{ route.name, route.name });
-            } else {
-                try out.print(allocator,
-                    \\        .{s} => |params| {{
-                    \\            const ctx = routes.LoadContext(.{s}){{ .allocator = allocator, .params =
-                , .{ route.name, route.name });
-                try writeParamsFromValue(allocator, &out, route, "params");
-            }
-            try out.print(allocator,
-                \\, .request = request }};
-                \\            const data = load_{s}.load(ctx) catch |err| return try writeUnexpected(allocator, writer, err, request);
-                \\            try writeRouteValue(allocator, writer, data);
-                \\        }},
-                \\
-            , .{route.name});
-        } else {
-            if (paramCount(route) == 0) {
-                try out.print(allocator,
-                    \\        .{s} => try writer.writeAll("{{}}"),
+                    \\            const data = load_{s}.load(ctx) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                    \\            try writeRouteValue(allocator, writer, data);
+                    \\        }},
                     \\
                 , .{route.name});
-            } else {
+            } else if (has_params) {
                 try out.print(allocator,
                     \\        .{s} => |params| try std.json.Stringify.value(params, .{{}}, writer),
                     \\
                 , .{route.name});
+            } else {
+                try out.print(allocator,
+                    \\        .{s} => try writer.writeAll("{{}}"),
+                    \\
+                , .{route.name});
+            }
+            continue;
+        }
+
+        // Layout data present: emit the chain envelope the client unwraps into
+        // per-level props ({ __yaan_chain, data, layouts: [...] }).
+        try writeLoadArmHeader(allocator, &out, route, has_params);
+        try out.appendSlice(allocator, "            try writer.writeAll(\"{\\\"__yaan_chain\\\":true,\\\"data\\\":\");\n");
+        if (has_page_load) {
+            try out.print(allocator,
+                \\            const data = load_{s}.load(ctx) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                \\            try writeRouteValue(allocator, writer, data);
+                \\
+            , .{route.name});
+        } else if (has_params) {
+            try out.appendSlice(allocator, "            try std.json.Stringify.value(params, .{}, writer);\n");
+        } else {
+            try out.appendSlice(allocator, "            try writer.writeAll(\"{}\");\n");
+        }
+        try out.appendSlice(allocator, "            try writer.writeAll(\",\\\"layouts\\\":[\");\n");
+        for (route.layouts, 0..) |layout, li| {
+            if (li > 0) try out.appendSlice(allocator, "            try writer.writeAll(\",\");\n");
+            if (layout.load_file) |load_file| {
+                const lname = try layoutLoadName(allocator, load_file);
+                defer allocator.free(lname);
+                try out.print(allocator,
+                    \\            const ld{d} = {s}.load(ctx) catch |err| return try writeUnexpected(allocator, writer, err, request);
+                    \\            try writeRouteValue(allocator, writer, ld{d});
+                    \\
+                , .{ li, lname, li });
+            } else {
+                try out.appendSlice(allocator, "            try writer.writeAll(\"null\");\n");
             }
         }
+        try out.appendSlice(allocator, "            try writer.writeAll(\"]}\");\n        },\n");
     }
     try out.appendSlice(allocator,
         \\    }
@@ -1086,6 +1236,24 @@ pub fn generateOptionsRunner(allocator: std.mem.Allocator, routes: []const Route
         \\
     );
     return out.toOwnedSlice(allocator);
+}
+
+/// Emits a load-runner match arm prelude: the arm pattern (capturing `params`
+/// for parameterized routes) and the `ctx` binding. Leaves the arm body open.
+fn writeLoadArmHeader(allocator: std.mem.Allocator, out: *std.ArrayList(u8), route: RoutePattern, has_params: bool) !void {
+    if (!has_params) {
+        try out.print(allocator,
+            \\        .{s} => {{
+            \\            const ctx = routes.LoadContext(.{s}){{ .allocator = allocator, .params = .{{}}
+        , .{ route.name, route.name });
+    } else {
+        try out.print(allocator,
+            \\        .{s} => |params| {{
+            \\            const ctx = routes.LoadContext(.{s}){{ .allocator = allocator, .params =
+        , .{ route.name, route.name });
+        try writeParamsFromValue(allocator, out, route, "params");
+    }
+    try out.appendSlice(allocator, ", .request = request };\n");
 }
 
 fn parseSegment(allocator: std.mem.Allocator, part: []const u8) !Segment {

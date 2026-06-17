@@ -108,7 +108,12 @@ CLI commands: `checkProject`, `buildProject`, `buildDev{Load,Action,Remote,Hook}
 ```
 
 `router.zig` discovers file routes under `src/routes` and drives generation of
-typed Zig route helpers + metadata.
+typed Zig route helpers + metadata. It also resolves each page's `+layout.yn`
+chain (root → page) and dedups layout loaders into hash-named modules
+(`router.layoutLoadName`) shared by the load runner, subprocess wiring, and the
+in-process `build.zig`. Layout `<slot>` outlets are emitted by `codegen.zig`
+(the child level is mounted by the client router, not the layout itself), and
+nested prerender skeletons are composed in `project.zig` via a slot sentinel.
 
 ### Generated code lives in `.yaan/`, build output in `dist/`
 
@@ -125,6 +130,14 @@ App source conventions (see `examples/app/src/`):
 - `src/routes/**/+page.yn` — file routes (`[id:int]`, `[slug:string]`,
   `[...path]` rest params, `(group)` pathless groups).
 - `+load.zig`, `+actions.zig`, `+page.options.zig` — typed Zig sidecars next to a page.
+- `src/routes/**/+layout.yn` — layouts wrapping a directory subtree. Exactly one
+  `<slot></slot>` per layout marks where the child level mounts. Each page
+  resolves to a layout chain (root outermost → page innermost); `(group)`
+  layouts scope to that group. Optional `+layout.load.zig` data loaders are
+  generic over the context (`load(ctx: anytype)`) since one layout wraps many
+  routes. The client router keeps a layout mounted across navigation while its
+  module and data are unchanged, and rebuilds the divergent tail (the page always
+  rebuilds since its params/data/form vary). See `examples/app/src/routes/+layout.yn`.
 - `src/remotes/*.remote.zig` — Dioxus-style server functions (`.query`/`.command`).
 - `src/hooks.zig` — Plug-style request pipeline hooks (`continue_`/`halt`, returns
   `hooks.Decision`); also the centralized `onError` seam.
@@ -151,7 +164,7 @@ same `routes.Result(T)` / `hooks.Decision` types:
 2. **In-process (`zig build dev-inproc`)** — `app_server.zig` is the per-app
    server entry; the app's handlers are linked directly into one binary, no
    subprocess spawned. Wired by `addInProcessServer` in the framework's
-   `build.zig`, which **discovers** every `+load.zig`/`+actions.zig`/`*.remote.zig`
+   `build.zig`, which **discovers** every `+load.zig`/`+actions.zig`/`+layout.load.zig`/`*.remote.zig`
    under `src/` and builds the module graph (no hardcoded route list). The
    server exposes per-stage function-pointer seams (`hook`/`load`/`action`/`remote`);
    an unset seam falls back to the subprocess runner. This build is

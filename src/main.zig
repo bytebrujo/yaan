@@ -8,8 +8,17 @@ pub fn main(init: std.process.Init) !void {
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "init")) {
-        try yaan.project.writeExampleApp(init.io, allocator);
-        std.debug.print("created example src/routes app\n", .{});
+        const name: ?[]const u8 = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else null;
+        yaan.project.writeExampleApp(init.io, allocator, name) catch |err| switch (err) {
+            // Message already printed by writeExampleApp; exit without a trace.
+            error.PathAlreadyExists => std.process.exit(1),
+            else => return err,
+        };
+        if (name) |n| {
+            std.debug.print("created Yaan app '{s}'\n\nnext steps:\n  cd {s}\n  yaan dev\n", .{ n, n });
+        } else {
+            std.debug.print("created Yaan app in the current directory\n\nnext steps:\n  yaan dev\n", .{});
+        }
     } else if (std.mem.eql(u8, cmd, "check")) {
         try runCheck(init.io, allocator);
     } else if (std.mem.eql(u8, cmd, "build")) {
@@ -28,6 +37,16 @@ pub fn main(init: std.process.Init) !void {
         const hsts = optionFlag(args, "--hsts");
         const hsts_max_age_text = optionValue(args, "--hsts-max-age") orelse "31536000";
         const hsts_max_age = try std.fmt.parseInt(u32, hsts_max_age_text, 10);
+        const max_body_length = try parseUsizeOption(args, "--max-body", 8 * 1024 * 1024);
+        const max_upload_file_length = try parseUsizeOption(args, "--max-upload-file", 8 * 1024 * 1024);
+        const max_upload_count = try parseUsizeOption(args, "--max-upload-count", 16);
+        const max_form_fields_length = try parseUsizeOption(args, "--max-form-fields", 1024 * 1024);
+        const max_multipart_header_length = try parseUsizeOption(args, "--max-multipart-header", 16 * 1024);
+        const max_header_length = try parseUsizeOption(args, "--max-headers", 32 * 1024);
+        const read_timeout_ms = try parseU32Option(args, "--read-timeout-ms", 10_000);
+        const csrf_protection = optionFlag(args, "--csrf");
+        const cookie_secret = optionValue(args, "--cookie-secret") orelse init.environ_map.get("YAAN_COOKIE_SECRET") orelse "";
+        if (csrf_protection and cookie_secret.len == 0) return error.MissingCookieSecret;
         try yaan.project.buildProject(init.io, allocator, "dist");
         try yaan.project.buildDevLoadRunner(init.io, allocator);
         try yaan.project.buildDevActionRunner(init.io, allocator);
@@ -51,6 +70,15 @@ pub fn main(init: std.process.Init) !void {
             .force_https = force_https,
             .hsts = hsts,
             .hsts_max_age = hsts_max_age,
+            .max_body_length = max_body_length,
+            .max_upload_file_length = max_upload_file_length,
+            .max_upload_count = max_upload_count,
+            .max_form_fields_length = max_form_fields_length,
+            .max_multipart_header_length = max_multipart_header_length,
+            .max_header_length = max_header_length,
+            .read_timeout_ms = read_timeout_ms,
+            .cookie_secret = cookie_secret,
+            .csrf_protection = csrf_protection,
         });
     } else {
         return usage();
@@ -94,15 +122,23 @@ fn optionList(allocator: std.mem.Allocator, args: []const []const u8, name: []co
     return items.toOwnedSlice(allocator);
 }
 
+fn parseUsizeOption(args: []const []const u8, name: []const u8, default: usize) !usize {
+    return try std.fmt.parseInt(usize, optionValue(args, name) orelse return default, 10);
+}
+
+fn parseU32Option(args: []const []const u8, name: []const u8, default: u32) !u32 {
+    return try std.fmt.parseInt(u32, optionValue(args, name) orelse return default, 10);
+}
+
 fn usage() void {
     std.debug.print(
         \\usage: yaan <command>
         \\
         \\commands:
-        \\  init
+        \\  init [name]
         \\  check
         \\  build [--out dist]
-        \\  dev [--host 127.0.0.1] [--port 5173] [--otel-endpoint http://127.0.0.1:4318/v1/traces] [--otel-service yaan-dev] [--prod-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--hsts-max-age 31536000]
+        \\  dev [--host 127.0.0.1] [--port 5173] [--otel-endpoint http://127.0.0.1:4318/v1/traces] [--otel-service yaan-dev] [--prod-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--hsts-max-age 31536000] [--csrf] [--cookie-secret secret] [--max-body bytes]
         \\
     , .{});
 }

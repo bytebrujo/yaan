@@ -13,6 +13,15 @@ pub fn build(b: *std.Build) void {
     const force_https = b.option(bool, "force-https", "Redirect insecure requests to HTTPS") orelse false;
     const hsts = b.option(bool, "hsts", "Emit Strict-Transport-Security on secure requests") orelse false;
     const hsts_max_age = b.option([]const u8, "hsts-max-age", "HSTS max-age in seconds") orelse "31536000";
+    const csrf = b.option(bool, "csrf", "Enable CSRF validation for action POSTs") orelse false;
+    const cookie_secret = b.option([]const u8, "cookie-secret", "Cookie signing secret override");
+    const max_body = b.option([]const u8, "max-body", "Maximum request body bytes");
+    const max_upload_file = b.option([]const u8, "max-upload-file", "Maximum upload file bytes");
+    const max_upload_count = b.option([]const u8, "max-upload-count", "Maximum uploaded file count");
+    const max_form_fields = b.option([]const u8, "max-form-fields", "Maximum accumulated form field bytes");
+    const max_multipart_header = b.option([]const u8, "max-multipart-header", "Maximum multipart part header bytes");
+    const max_headers = b.option([]const u8, "max-headers", "Maximum HTTP header bytes");
+    const read_timeout_ms = b.option([]const u8, "read-timeout-ms", "Request read timeout in milliseconds");
 
     // The framework is a dependency: its `yaan` module, the `yaan` CLI, and the
     // in-process server builder all come from it.
@@ -55,6 +64,15 @@ pub fn build(b: *std.Build) void {
     if (force_https) dev_cmd.addArg("--force-https");
     if (hsts) dev_cmd.addArg("--hsts");
     dev_cmd.addArgs(&.{ "--hsts-max-age", hsts_max_age });
+    if (csrf) dev_cmd.addArg("--csrf");
+    if (cookie_secret) |value| dev_cmd.addArgs(&.{ "--cookie-secret", value });
+    if (max_body) |value| dev_cmd.addArgs(&.{ "--max-body", value });
+    if (max_upload_file) |value| dev_cmd.addArgs(&.{ "--max-upload-file", value });
+    if (max_upload_count) |value| dev_cmd.addArgs(&.{ "--max-upload-count", value });
+    if (max_form_fields) |value| dev_cmd.addArgs(&.{ "--max-form-fields", value });
+    if (max_multipart_header) |value| dev_cmd.addArgs(&.{ "--max-multipart-header", value });
+    if (max_headers) |value| dev_cmd.addArgs(&.{ "--max-headers", value });
+    if (read_timeout_ms) |value| dev_cmd.addArgs(&.{ "--read-timeout-ms", value });
     dev_step.dependOn(&dev_cmd.step);
 
     // In-process server: handlers linked into the binary, no runner subprocesses.
@@ -68,5 +86,21 @@ pub fn build(b: *std.Build) void {
     const dev_inproc_step = b.step("dev-inproc", "Run the in-process server (handlers linked in, no runner subprocesses)");
     const dev_inproc_cmd = b.addRunArtifact(app_server);
     dev_inproc_cmd.addArgs(&.{ "--host", dev_host, "--port", dev_port });
+    if (trusted_proxy) |value| dev_inproc_cmd.addArgs(&.{ "--trusted-proxy", value });
+    if (force_https) dev_inproc_cmd.addArg("--force-https");
+    if (hsts) dev_inproc_cmd.addArg("--hsts");
+    dev_inproc_cmd.addArgs(&.{ "--hsts-max-age", hsts_max_age });
+    if (csrf) dev_inproc_cmd.addArg("--csrf");
+    if (cookie_secret) |value| dev_inproc_cmd.addArgs(&.{ "--cookie-secret", value });
+    if (max_body) |value| dev_inproc_cmd.addArgs(&.{ "--max-body", value });
+    if (max_upload_file) |value| dev_inproc_cmd.addArgs(&.{ "--max-upload-file", value });
+    if (max_upload_count) |value| dev_inproc_cmd.addArgs(&.{ "--max-upload-count", value });
+    if (max_form_fields) |value| dev_inproc_cmd.addArgs(&.{ "--max-form-fields", value });
+    if (max_multipart_header) |value| dev_inproc_cmd.addArgs(&.{ "--max-multipart-header", value });
+    if (max_headers) |value| dev_inproc_cmd.addArgs(&.{ "--max-headers", value });
+    if (read_timeout_ms) |value| dev_inproc_cmd.addArgs(&.{ "--read-timeout-ms", value });
+    // The in-process binary is production-safe by default; opt into verbose
+    // error pages for local dev unless -Dprod-errors was requested.
+    if (!prod_errors) dev_inproc_cmd.addArg("--debug-errors");
     dev_inproc_step.dependOn(&dev_inproc_cmd.step);
 }

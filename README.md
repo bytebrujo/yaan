@@ -16,6 +16,18 @@ cd examples/app && zig build test
 cd examples/app && zig build dev-inproc   # in-process server: handlers linked in, no runner subprocesses
 ```
 
+Start a new app with the `yaan` CLI:
+
+```sh
+yaan init my-app   # scaffold a project (creates my-app/ with src/, static/, build.zig)
+cd my-app
+yaan dev           # build and serve; no build.zig dependency needed for the dev loop
+```
+
+`yaan init` with no name scaffolds into the current directory. The generated
+`build.zig`/`build.zig.zon` wrap the CLI so `zig build dev` works too, but the
+`yaan` binary alone is enough to develop, check, and build an app.
+
 V1 is intentionally small: browser SPA output only, opaque JavaScript in
 `<script>`, keyed and index-based `{#each}`, component-scoped CSS, and no Node
 toolchain requirement.
@@ -227,9 +239,20 @@ src/error/404.html -> dist/error/404.html and dist/404.html
 
 Custom error pages are raw, self-contained HTML. They are intentionally not run
 through layouts, hooks, loaders, or component rendering, which avoids recursive
-failures when the normal rendering path is what broke. In dev, error pages may
-show safe details such as code/id; pass `--prod-errors` or
-`-Dprod-errors=true` to force production-safe generic 500 output.
+failures when the normal rendering path is what broke. The default verbosity
+depends on which server you run:
+
+- The `yaan dev` subprocess server shows safe details such as code/id by
+  default; pass `--prod-errors` or `-Dprod-errors=true` to force
+  production-safe generic 500 output.
+- The in-process server (`dev-inproc` / the deploy artifact) is the production
+  build, so it is production-safe by default and never leaks internals. Pass
+  `--debug-errors` to opt into verbose error pages for local development; the
+  `dev-inproc` build step adds it for you unless `-Dprod-errors=true` is set.
+
+Either way, unexpected errors are correlated by a stable `err-<hash>` id (a hash
+of the error name and request path) that appears both in the server log and, in
+debug mode, in the rendered page — the same id regardless of transport.
 
 TLS is intentionally terminated upstream in the recommended production setup:
 Caddy, nginx, a cloud load balancer, or Cloudflare handles HTTPS, and Yaan
@@ -242,16 +265,19 @@ yaan dev \
   --trusted-proxy 127.0.0.1,::1 \
   --force-https \
   --hsts \
-  --hsts-max-age 31536000
+  --hsts-max-age 31536000 \
+  --csrf
 ```
 
 `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` are honored only
 when the socket peer is listed in `--trusted-proxy`; headers from any other
-client are ignored so a public client cannot spoof HTTPS. `--force-https`
+client are ignored so a public client cannot spoof HTTPS. When proxies append
+header values, Yaan uses the value nearest the trusted proxy. `--force-https`
 redirects insecure requests to the effective `https://` URL with `308 Permanent
 Redirect`. `--hsts` emits `Strict-Transport-Security` only for requests Yaan
 considers secure. HSTS is off by default because enabling it on localhost can
-poison browser state and force HTTPS for future local requests.
+poison browser state and force HTTPS for future local requests. `--csrf` requires
+`YAAN_COOKIE_SECRET` or `--cookie-secret`.
 
 Yaan does not terminate production TLS in-process. If local/simple HTTPS is
 added later, it should be framed as a dev convenience backed by a vetted TLS
@@ -408,6 +434,7 @@ writes it under `dist/assets/`, and emits both browser and Zig manifests:
 static/logo.svg -> dist/assets/logo.4e9d8c25a60e4261.svg
 dist/assets.js
 dist/assets.json
+dist/assets.manifest.json
 .yaan/assets.zig
 ```
 
@@ -423,10 +450,13 @@ Server-side Zig can import the generated manifest:
 const assets = @import("assets");
 
 const logo = assets.asset("logo.svg");
+const entry = assets.assetEntry("logo.svg");
 ```
 
 Hashed `/assets/...` files are served with
-`Cache-Control: public, max-age=31536000, immutable`. Yaan does not implement
+`Cache-Control: public, max-age=31536000, immutable`. `assets.js` also exports
+`assetManifest` and `assetEntry()` for service-worker precache manifests and
+observability tags. Yaan does not implement
 image resizing/transcoding or icon processing; use a CDN or shell out to image
 tools for that, and prefer CSS/icon-font/SVG-sprite approaches for icons.
 `yaan check` and `yaan build` warn when an `<img>` lacks `alt`.
@@ -572,8 +602,18 @@ same handles are available from `ctx.request.upload("photo")`. Temp files are
 deleted when the request finishes unless the action copies them elsewhere. Yaan
 does not provide storage backends, file validation policy, virus scanning, or
 image processing. The original `filename` is never used as a server filesystem
-path. Request bodies are capped at 8 MiB by default; oversized uploads return
-`413 Payload Too Large`.
+path. Request bodies and individual file parts are capped at 8 MiB by default;
+multipart uploads also cap file count, form-field bytes, multipart header bytes,
+and total HTTP header bytes. Oversized uploads return `413 Payload Too Large`;
+malformed multipart bodies return `400 Bad Request`.
+
+Signed cookies and CSRF helpers are available from generated route contexts:
+`ctx.request.cookie("name")`, `ctx.request.signedCookie(...)`,
+`routes.signedCookieHeader(...)`, `routes.clearCookie(...)`, and
+`routes.csrfPair(...)`. Signed cookies use HMAC-SHA256 with
+`YAAN_COOKIE_SECRET` (or explicit `--cookie-secret`). When `--csrf` is enabled,
+unsafe action POSTs must include the signed CSRF value in either `_csrf` or
+`X-CSRF-Token`, matching the `yaan_csrf` cookie.
 
 By default the dev server runs app code as separately-compiled runner
 executables — `.yaan/hook_runner`, `.yaan/load_runner`, `.yaan/action_runner`,

@@ -25,11 +25,19 @@ pub const StaticServerOptions = struct {
     observability: observability.Config = .{},
     debug_errors: bool = true,
     max_body_length: usize = 8 * 1024 * 1024,
+    max_upload_file_length: usize = 8 * 1024 * 1024,
+    max_upload_count: usize = 16,
+    max_form_fields_length: usize = 1024 * 1024,
+    max_multipart_header_length: usize = 16 * 1024,
+    max_header_length: usize = 32 * 1024,
+    read_timeout_ms: u32 = 10_000,
     trusted_proxies: []const []const u8 = &.{},
     force_https: bool = false,
     hsts: bool = false,
     hsts_max_age: u32 = 31_536_000,
     security_headers: bool = true,
+    cookie_secret: []const u8 = "",
+    csrf_protection: bool = false,
     // Yaan emits zero inline scripts, so script-src stays strict 'self' with no
     // unsafe-inline. Inline style attributes (style="...") in components are
     // permitted via style-src 'unsafe-inline'.
@@ -176,9 +184,9 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
     const accept_encoding = requestHeader(request.headers, "accept-encoding") orelse "";
     const content_type = requestHeader(request.headers, "content-type") orelse "";
     const host = requestHeader(request.headers, "host") orelse "";
-    const forwarded_proto = firstForwardedValue(requestHeader(request.headers, "x-forwarded-proto") orelse "");
-    const forwarded_host = firstForwardedValue(requestHeader(request.headers, "x-forwarded-host") orelse "");
-    const forwarded_port = firstForwardedValue(requestHeader(request.headers, "x-forwarded-port") orelse "");
+    const forwarded_proto = nearestForwardedValue(requestHeader(request.headers, "x-forwarded-proto") orelse "");
+    const forwarded_host = nearestForwardedValue(requestHeader(request.headers, "x-forwarded-host") orelse "");
+    const forwarded_port = nearestForwardedValue(requestHeader(request.headers, "x-forwarded-port") orelse "");
 
     const security = try requestSecurity(allocator, request.peer, options.trusted_proxies, host, forwarded_proto, forwarded_host, forwarded_port);
     defer if (security.host.ptr != host.ptr) allocator.free(security.host);
@@ -204,6 +212,15 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
             .code = "payload_too_large",
         }, response_headers.items, null, options.debug_errors);
     }
+
+    const headers_json = try headersJson(allocator, request.headers);
+    defer allocator.free(headers_json);
+    const meta_json = try metaJson(allocator, .{
+        .secure = security.secure,
+        .csrf_protection = options.csrf_protection and options.cookie_secret.len > 0,
+        .cookie_secret = options.cookie_secret,
+    });
+    defer allocator.free(meta_json);
 
     var path = sanitizePath(target);
     // Decision data must outlive the routing/static phases below (response
@@ -270,7 +287,17 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
         var multipart_data: ?MultipartData = null;
         defer if (multipart_data) |*data| data.deinit(io, allocator);
         const action_body = if (multipartBoundary(content_type)) |boundary| body: {
-            multipart_data = try parseMultipart(io, allocator, request.body, boundary);
+            multipart_data = parseMultipart(io, allocator, request.body, boundary, options) catch |err| switch (err) {
+                error.PayloadTooLarge => return try testRenderedError(io, allocator, options.root, 413, accept, .{
+                    .message = "Upload is too large",
+                    .code = "payload_too_large",
+                }, response_headers.items, null, options.debug_errors),
+                error.MalformedMultipart => return try testRenderedError(io, allocator, options.root, 400, accept, .{
+                    .message = "Malformed multipart body",
+                    .code = "bad_multipart",
+                }, response_headers.items, null, options.debug_errors),
+                else => return err,
+            };
             break :body multipart_data.?.fields_body;
         } else request.body;
         const uploads_json = if (multipart_data) |data|
@@ -279,10 +306,17 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
             try allocator.dupe(u8, "[]");
         defer allocator.free(uploads_json);
 
+        if (options.csrf_protection and options.cookie_secret.len > 0 and !validCsrfForRequest(allocator, request.headers, action_body, options.cookie_secret)) {
+            return try testRenderedError(io, allocator, options.root, 403, accept, .{
+                .message = "Invalid CSRF token",
+                .code = "csrf_invalid",
+            }, response_headers.items, null, options.debug_errors);
+        }
+
         const data = if (options.action) |f|
-            try f(io, allocator, method, path, action_body, uploads_json)
+            try f(io, allocator, method, path, action_body, uploads_json, headers_json, meta_json)
         else
-            runActionRunner(io, allocator, options.action_runner, method, path, action_body, uploads_json) catch |err| switch (err) {
+            runActionRunner(io, allocator, options.action_runner, method, path, action_body, uploads_json, headers_json, meta_json) catch |err| switch (err) {
                 error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_action\"}"),
                 else => return err,
             };
@@ -301,9 +335,9 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
         const load_path = (try queryValue(allocator, target, "path")) orelse try allocator.dupe(u8, "/");
         defer allocator.free(load_path);
         const data = if (options.load) |f|
-            try f(io, allocator, method, load_path)
+            try f(io, allocator, method, load_path, headers_json, meta_json)
         else
-            runLoadRunner(io, allocator, options.load_runner, method, load_path) catch |err| switch (err) {
+            runLoadRunner(io, allocator, options.load_runner, method, load_path, headers_json, meta_json) catch |err| switch (err) {
                 error.FileNotFound => try allocator.dupe(u8, "null"),
                 else => return err,
             };
@@ -407,8 +441,8 @@ pub const Hook = *const fn (io: std.Io, allocator: std.mem.Allocator, hook_runne
 // In-process handler seams. Each returns the same JSON the corresponding runner
 // subprocess would have written to stdout, so the downstream rendering is
 // unchanged. Null falls back to the subprocess runner.
-pub const LoadFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8) anyerror![]u8;
-pub const ActionFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8) anyerror![]u8;
+pub const LoadFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, headers_json: []const u8, meta_json: []const u8) anyerror![]u8;
+pub const ActionFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, uploads_json: []const u8, headers_json: []const u8, meta_json: []const u8) anyerror![]u8;
 pub const RemoteFn = *const fn (io: std.Io, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8) anyerror![]u8;
 
 fn freeHeaders(allocator: std.mem.Allocator, headers: []const Header) void {
@@ -530,6 +564,12 @@ const RequestSecurity = struct {
     host: []const u8,
 };
 
+pub const RequestMeta = struct {
+    secure: bool = false,
+    csrf_protection: bool = false,
+    cookie_secret: []const u8 = "",
+};
+
 const UploadHandle = struct {
     name: []const u8,
     filename: []const u8,
@@ -574,26 +614,42 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
     var forwarded_proto: []const u8 = "";
     var forwarded_host: []const u8 = "";
     var forwarded_port: []const u8 = "";
+    var request_headers: std.ArrayList(Header) = .empty;
+    defer deinitHeaderList(allocator, &request_headers);
+    var header_bytes: usize = line.len;
     while (true) {
         const header_line = reader.interface.takeDelimiterInclusive('\n') catch return;
+        header_bytes += header_line.len;
+        if (header_bytes > options.max_header_length) {
+            try writeResponse(io, stream, "431 Request Header Fields Too Large", "text/plain; charset=utf-8", "Request headers are too large");
+            return;
+        }
         const header = std.mem.trim(u8, header_line, "\r\n");
         if (header.len == 0) break;
-        if (std.ascii.startsWithIgnoreCase(header, "content-length:")) {
-            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, header["content-length:".len..], " \t"), 10);
-        } else if (std.ascii.startsWithIgnoreCase(header, "accept-encoding:")) {
-            accept_encoding = std.mem.trim(u8, header["accept-encoding:".len..], " \t");
-        } else if (std.ascii.startsWithIgnoreCase(header, "accept:")) {
-            accept = std.mem.trim(u8, header["accept:".len..], " \t");
-        } else if (std.ascii.startsWithIgnoreCase(header, "content-type:")) {
-            content_type = std.mem.trim(u8, header["content-type:".len..], " \t");
-        } else if (std.ascii.startsWithIgnoreCase(header, "host:")) {
-            host = std.mem.trim(u8, header["host:".len..], " \t");
-        } else if (std.ascii.startsWithIgnoreCase(header, "x-forwarded-proto:")) {
-            forwarded_proto = firstForwardedValue(std.mem.trim(u8, header["x-forwarded-proto:".len..], " \t"));
-        } else if (std.ascii.startsWithIgnoreCase(header, "x-forwarded-host:")) {
-            forwarded_host = firstForwardedValue(std.mem.trim(u8, header["x-forwarded-host:".len..], " \t"));
-        } else if (std.ascii.startsWithIgnoreCase(header, "x-forwarded-port:")) {
-            forwarded_port = firstForwardedValue(std.mem.trim(u8, header["x-forwarded-port:".len..], " \t"));
+        const colon = std.mem.indexOfScalar(u8, header, ':') orelse continue;
+        const header_name = std.mem.trim(u8, header[0..colon], " \t");
+        const header_value = std.mem.trim(u8, header[colon + 1 ..], " \t");
+        try request_headers.append(allocator, .{
+            .name = try allocator.dupe(u8, header_name),
+            .value = try allocator.dupe(u8, header_value),
+        });
+        const stored = request_headers.items[request_headers.items.len - 1].value;
+        if (std.ascii.eqlIgnoreCase(header_name, "content-length")) {
+            content_length = try std.fmt.parseInt(usize, stored, 10);
+        } else if (std.ascii.eqlIgnoreCase(header_name, "accept-encoding")) {
+            accept_encoding = stored;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "accept")) {
+            accept = stored;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "content-type")) {
+            content_type = stored;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "host")) {
+            host = stored;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "x-forwarded-proto")) {
+            forwarded_proto = nearestForwardedValue(stored);
+        } else if (std.ascii.eqlIgnoreCase(header_name, "x-forwarded-host")) {
+            forwarded_host = nearestForwardedValue(stored);
+        } else if (std.ascii.eqlIgnoreCase(header_name, "x-forwarded-port")) {
+            forwarded_port = nearestForwardedValue(stored);
         }
     }
     const security = try requestSecurity(allocator, stream.socket.address, options.trusted_proxies, host, forwarded_proto, forwarded_host, forwarded_port);
@@ -630,6 +686,15 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
     else
         try allocator.dupe(u8, "");
     defer allocator.free(request_body);
+
+    const headers_json = try headersJson(allocator, request_headers.items);
+    defer allocator.free(headers_json);
+    const meta_json = try metaJson(allocator, .{
+        .secure = security.secure,
+        .csrf_protection = options.csrf_protection and options.cookie_secret.len > 0,
+        .cookie_secret = options.cookie_secret,
+    });
+    defer allocator.free(meta_json);
 
     var path = sanitizePath(target);
     // Decision data must outlive the routing/static phases below.
@@ -710,7 +775,25 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
         var multipart_data: ?MultipartData = null;
         defer if (multipart_data) |*data| data.deinit(io, allocator);
         const action_body = if (multipartBoundary(content_type)) |boundary| body: {
-            multipart_data = try parseMultipart(io, allocator, request_body, boundary);
+            multipart_data = parseMultipart(io, allocator, request_body, boundary, options) catch |err| switch (err) {
+                error.PayloadTooLarge => {
+                    try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = 413 });
+                    try writeRenderedError(io, allocator, stream, root, 413, accept, .{
+                        .message = "Upload is too large",
+                        .code = "payload_too_large",
+                    }, response_headers_list.items, null, debug_errors);
+                    return;
+                },
+                error.MalformedMultipart => {
+                    try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = 400 });
+                    try writeRenderedError(io, allocator, stream, root, 400, accept, .{
+                        .message = "Malformed multipart body",
+                        .code = "bad_multipart",
+                    }, response_headers_list.items, null, debug_errors);
+                    return;
+                },
+                else => return err,
+            };
             break :body multipart_data.?.fields_body;
         } else request_body;
         const uploads_json = if (multipart_data) |data|
@@ -719,11 +802,20 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
             try allocator.dupe(u8, "[]");
         defer allocator.free(uploads_json);
 
+        if (options.csrf_protection and options.cookie_secret.len > 0 and !validCsrfForRequest(allocator, request_headers.items, action_body, options.cookie_secret)) {
+            try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = 403 });
+            try writeRenderedError(io, allocator, stream, root, 403, accept, .{
+                .message = "Invalid CSRF token",
+                .code = "csrf_invalid",
+            }, response_headers_list.items, null, debug_errors);
+            return;
+        }
+
         const data = action: {
             const span = try tracer.startChild(&trace, "yaan.action");
             defer tracer.endSpan(&trace, span);
-            if (options.action) |f| break :action try f(io, allocator, method, path, action_body, uploads_json);
-            break :action runActionRunner(io, allocator, action_runner, method, path, action_body, uploads_json) catch |err| switch (err) {
+            if (options.action) |f| break :action try f(io, allocator, method, path, action_body, uploads_json, headers_json, meta_json);
+            break :action runActionRunner(io, allocator, action_runner, method, path, action_body, uploads_json, headers_json, meta_json) catch |err| switch (err) {
                 error.FileNotFound => try allocator.dupe(u8, "{\"error\":\"no_action\"}"),
                 else => return err,
             };
@@ -749,8 +841,8 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
             const span = try tracer.startChild(&trace, "yaan.load");
             defer tracer.endSpan(&trace, span);
             try tracer.setAttribute(span, "yaan.route.path", .{ .string = load_path });
-            if (options.load) |f| break :load try f(io, allocator, method, load_path);
-            break :load runLoadRunner(io, allocator, load_runner, method, load_path) catch |err| switch (err) {
+            if (options.load) |f| break :load try f(io, allocator, method, load_path, headers_json, meta_json);
+            break :load runLoadRunner(io, allocator, load_runner, method, load_path, headers_json, meta_json) catch |err| switch (err) {
                 error.FileNotFound => try allocator.dupe(u8, "null"),
                 else => return err,
             };
@@ -855,13 +947,14 @@ fn sameIpIgnoringPort(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
     };
 }
 
-fn firstForwardedValue(value: []const u8) []const u8 {
-    const first = if (std.mem.indexOfScalar(u8, value, ',')) |i| value[0..i] else value;
-    return std.mem.trim(u8, first, " \t");
+fn nearestForwardedValue(value: []const u8) []const u8 {
+    const last = if (std.mem.lastIndexOfScalar(u8, value, ',')) |i| value[i + 1 ..] else value;
+    return std.mem.trim(u8, last, " \t");
 }
 
 fn forwardedHostWithPort(allocator: std.mem.Allocator, forwarded_host: []const u8, forwarded_port: []const u8) ![]const u8 {
-    if (forwarded_port.len == 0 or std.mem.eql(u8, forwarded_port, "443") or hostHasPort(forwarded_host)) {
+    if (!validHostValue(forwarded_host)) return allocator.dupe(u8, "");
+    if (forwarded_port.len == 0 or std.mem.eql(u8, forwarded_port, "443") or hostHasPort(forwarded_host) or !validPortValue(forwarded_port)) {
         return allocator.dupe(u8, forwarded_host);
     }
     return std.fmt.allocPrint(allocator, "{s}:{s}", .{ forwarded_host, forwarded_port });
@@ -874,9 +967,26 @@ fn hostHasPort(host: []const u8) bool {
 }
 
 fn httpsRedirectLocation(allocator: std.mem.Allocator, host: []const u8, target: []const u8) ![]u8 {
-    const safe_host = if (host.len > 0 and validHeaderValue(host)) host else "localhost";
+    const safe_host = if (host.len > 0 and validHostValue(host)) host else "localhost";
     const safe_target = if (target.len > 0 and target[0] == '/') target else "/";
     return std.fmt.allocPrint(allocator, "https://{s}{s}", .{ safe_host, safe_target });
+}
+
+fn validHostValue(host: []const u8) bool {
+    if (host.len == 0 or !validHeaderValue(host)) return false;
+    for (host) |c| {
+        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')) continue;
+        if (c == '.' or c == '-' or c == '_' or c == ':' or c == '[' or c == ']') continue;
+        return false;
+    }
+    return true;
+}
+
+fn validPortValue(port: []const u8) bool {
+    if (port.len == 0 or port.len > 5) return false;
+    for (port) |c| if (c < '0' or c > '9') return false;
+    const parsed = std.fmt.parseInt(u16, port, 10) catch return false;
+    return parsed > 0;
 }
 
 fn queryValue(allocator: std.mem.Allocator, target: []const u8, key: []const u8) !?[]u8 {
@@ -920,7 +1030,7 @@ fn multipartBoundary(content_type: []const u8) ?[]const u8 {
     return null;
 }
 
-fn parseMultipart(io: std.Io, allocator: std.mem.Allocator, body: []const u8, boundary: []const u8) !MultipartData {
+fn parseMultipart(io: std.Io, allocator: std.mem.Allocator, body: []const u8, boundary: []const u8, options: StaticServerOptions) !MultipartData {
     const delimiter = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
     defer allocator.free(delimiter);
     var fields: std.ArrayList(u8) = .empty;
@@ -940,6 +1050,7 @@ fn parseMultipart(io: std.Io, allocator: std.mem.Allocator, body: []const u8, bo
         if (std.mem.startsWith(u8, part, "\r\n")) part = part[2..];
         if (part.len == 0) continue;
         const header_end = std.mem.indexOf(u8, part, "\r\n\r\n") orelse return error.MalformedMultipart;
+        if (header_end > options.max_multipart_header_length) return error.PayloadTooLarge;
         const header_block = part[0..header_end];
         var content = part[header_end + 4 ..];
         if (std.mem.endsWith(u8, content, "\r\n")) content = content[0 .. content.len - 2];
@@ -948,8 +1059,10 @@ fn parseMultipart(io: std.Io, allocator: std.mem.Allocator, body: []const u8, bo
         const name = dispositionParam(disposition, "name") orelse return error.MalformedMultipart;
         const filename = dispositionParam(disposition, "filename");
         if (filename) |original_filename| {
+            if (upload_index >= options.max_upload_count) return error.PayloadTooLarge;
+            if (content.len > options.max_upload_file_length) return error.PayloadTooLarge;
             const content_type = multipartHeader(header_block, "content-type") orelse "application/octet-stream";
-            const path = try uniqueUploadPath(allocator, upload_index);
+            const path = try uniqueUploadPath(io, allocator, upload_index);
             errdefer allocator.free(path);
             upload_index += 1;
             try std.Io.Dir.cwd().createDirPath(io, ".yaan/tmp");
@@ -962,10 +1075,12 @@ fn parseMultipart(io: std.Io, allocator: std.mem.Allocator, body: []const u8, bo
                 .size = content.len,
             });
         } else {
+            if (fields.items.len + name.len + content.len + 2 > options.max_form_fields_length) return error.PayloadTooLarge;
             if (fields.items.len > 0) try fields.append(allocator, '&');
             try appendFormEscaped(allocator, &fields, name);
             try fields.append(allocator, '=');
             try appendFormEscaped(allocator, &fields, content);
+            if (fields.items.len > options.max_form_fields_length) return error.PayloadTooLarge;
         }
     }
 
@@ -1010,9 +1125,13 @@ fn dispositionParam(disposition: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn uniqueUploadPath(allocator: std.mem.Allocator, index: usize) ![]u8 {
+fn uniqueUploadPath(io: std.Io, allocator: std.mem.Allocator, index: usize) ![]u8 {
     const counter = @atomicRmw(usize, &upload_counter, .Add, 1, .monotonic);
-    return std.fmt.allocPrint(allocator, ".yaan/tmp/upload-{d}-{d}", .{ counter, index });
+    var random_bytes: [16]u8 = undefined;
+    io.randomSecure(&random_bytes) catch io.random(&random_bytes);
+    var random_hex: [32]u8 = undefined;
+    writeHexBytes(random_hex[0..], &random_bytes);
+    return std.fmt.allocPrint(allocator, ".yaan/tmp/upload-{d}-{d}-{s}", .{ counter, index, random_hex });
 }
 
 fn appendFormEscaped(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
@@ -1037,9 +1156,122 @@ fn uploadsJson(allocator: std.mem.Allocator, uploads: []const UploadHandle) ![]u
     return allocator.dupe(u8, writer.written());
 }
 
-fn runLoadRunner(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, method: []const u8, path: []const u8) ![]u8 {
+fn headersJson(allocator: std.mem.Allocator, headers: []const Header) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try std.json.Stringify.value(headers, .{}, &writer.writer);
+    return allocator.dupe(u8, writer.written());
+}
+
+fn metaJson(allocator: std.mem.Allocator, meta: RequestMeta) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try std.json.Stringify.value(meta, .{}, &writer.writer);
+    return allocator.dupe(u8, writer.written());
+}
+
+fn deinitHeaderList(allocator: std.mem.Allocator, headers: *std.ArrayList(Header)) void {
+    for (headers.items) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    headers.deinit(allocator);
+}
+
+pub fn signedCookieValue(allocator: std.mem.Allocator, name: []const u8, value: []const u8, secret: []const u8) ![]u8 {
+    if (secret.len == 0) return error.MissingCookieSecret;
+    const encoded_value = try base64Encode(allocator, value);
+    defer allocator.free(encoded_value);
+    const signed_part = try cookieMacInput(allocator, name, encoded_value);
+    defer allocator.free(signed_part);
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signed_part, secret);
+    const encoded_mac = try base64Encode(allocator, &mac);
+    defer allocator.free(encoded_mac);
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ encoded_value, encoded_mac });
+}
+
+pub fn verifySignedCookie(allocator: std.mem.Allocator, name: []const u8, signed_value: []const u8, secret: []const u8) !?[]u8 {
+    if (secret.len == 0) return error.MissingCookieSecret;
+    const dot = std.mem.lastIndexOfScalar(u8, signed_value, '.') orelse return null;
+    const encoded_value = signed_value[0..dot];
+    const encoded_mac = signed_value[dot + 1 ..];
+    const signed_part = try cookieMacInput(allocator, name, encoded_value);
+    defer allocator.free(signed_part);
+    var expected: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, signed_part, secret);
+    const actual = base64Decode(allocator, encoded_mac) catch return null;
+    defer allocator.free(actual);
+    if (actual.len != expected.len) return null;
+    var actual_array: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    @memcpy(actual_array[0..], actual);
+    if (!std.crypto.timing_safe.eql([std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8, actual_array, expected)) return null;
+    return base64Decode(allocator, encoded_value) catch return null;
+}
+
+fn cookieMacInput(allocator: std.mem.Allocator, name: []const u8, encoded_value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ name, encoded_value });
+}
+
+fn base64Encode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const out = try allocator.alloc(u8, encoder.calcSize(value.len));
+    _ = encoder.encode(out, value);
+    return out;
+}
+
+fn base64Decode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const size = try decoder.calcSizeForSlice(value);
+    const out = try allocator.alloc(u8, size);
+    errdefer allocator.free(out);
+    try decoder.decode(out, value);
+    return out;
+}
+
+fn validCsrfForRequest(allocator: std.mem.Allocator, headers: []const Header, body: []const u8, secret: []const u8) bool {
+    const cookie_token = cookieValue(headers, "yaan_csrf") orelse return false;
+    const submitted = requestHeader(headers, "x-csrf-token") orelse formFieldRaw(body, "_csrf") orelse return false;
+    if (!std.mem.eql(u8, cookie_token, submitted)) return false;
+    const decoded = verifySignedCookie(allocator, "yaan_csrf", cookie_token, secret) catch return false;
+    if (decoded) |value| {
+        allocator.free(value);
+        return true;
+    }
+    return false;
+}
+
+fn cookieValue(headers: []const Header, name: []const u8) ?[]const u8 {
+    const cookie_header = requestHeader(headers, "cookie") orelse return null;
+    var parts = std.mem.splitScalar(u8, cookie_header, ';');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (std.mem.eql(u8, trimmed[0..eq], name)) return trimmed[eq + 1 ..];
+    }
+    return null;
+}
+
+fn formFieldRaw(body: []const u8, name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, body, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+fn writeHexBytes(out: []u8, bytes: []const u8) void {
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, i| {
+        out[i * 2] = alphabet[byte >> 4];
+        out[i * 2 + 1] = alphabet[byte & 0x0f];
+    }
+}
+
+fn runLoadRunner(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, method: []const u8, path: []const u8, headers_json: []const u8, meta_json: []const u8) ![]u8 {
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ runner, method, path },
+        .argv = &.{ runner, method, path, headers_json, meta_json },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
@@ -1056,9 +1288,9 @@ fn runLoadRunner(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, m
     return result.stdout;
 }
 
-fn runActionRunner(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, method: []const u8, path: []const u8, body: []const u8, uploads: []const u8) ![]u8 {
+fn runActionRunner(io: std.Io, allocator: std.mem.Allocator, runner: []const u8, method: []const u8, path: []const u8, body: []const u8, uploads: []const u8, headers_json: []const u8, meta_json: []const u8) ![]u8 {
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ runner, method, path, body, uploads },
+        .argv = &.{ runner, method, path, body, uploads, headers_json, meta_json },
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
@@ -1615,6 +1847,48 @@ test "path pattern matching mirrors the client router" {
     try std.testing.expect(!pathMatchesPattern("/shop/cart", "/shop/wish"));
 }
 
+test "error rendering hides internals in prod and exposes them in debug" {
+    const a = std.testing.allocator;
+    const leaky = ErrorBody{ .message = "db connection string is postgres://secret", .code = "db_down", .id = "err-abc" };
+
+    // 5xx in prod: message is replaced, code forced to internal_error, no leak.
+    {
+        const json = try errorJson(a, 500, leaky, false);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "Internal Error") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "internal_error") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "postgres://secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "db_down") == null);
+    }
+    // 5xx in debug: the real message and code come through.
+    {
+        const json = try errorJson(a, 500, leaky, true);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "postgres://secret") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "db_down") != null);
+    }
+    // The HTML renderer only emits the code/id debug block when debug_errors.
+    {
+        const html = try defaultErrorHtml(a, 500, leaky, false);
+        defer a.free(html);
+        try std.testing.expect(std.mem.indexOf(u8, html, "postgres://secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, html, "err-abc") == null);
+        try std.testing.expect(std.mem.indexOf(u8, html, "Internal Error") != null);
+    }
+    {
+        const html = try defaultErrorHtml(a, 500, leaky, true);
+        defer a.free(html);
+        try std.testing.expect(std.mem.indexOf(u8, html, "err-abc") != null);
+    }
+    // 4xx messages are caller-facing and pass through even in prod.
+    {
+        const body = ErrorBody{ .message = "id must be an integer", .code = "bad_request" };
+        const json = try errorJson(a, 400, body, false);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "id must be an integer") != null);
+    }
+}
+
 test "navigable html detection" {
     try std.testing.expect(isNavigableHtml("GET", "text/html", "/users/42"));
     try std.testing.expect(isNavigableHtml("GET", "text/html,*/*", "/"));
@@ -1646,7 +1920,7 @@ test "multipart parser writes upload handles and urlencoded fields" {
         "\r\n" ++
         "PNGDATA\r\n" ++
         "--yaan--\r\n";
-    var parsed = try parseMultipart(io, allocator, body, "yaan");
+    var parsed = try parseMultipart(io, allocator, body, "yaan", .{});
     defer parsed.deinit(io, allocator);
 
     try std.testing.expectEqualStrings("title=hello+world", parsed.fields_body);
@@ -1692,8 +1966,90 @@ test "trusted forwarded headers determine secure host" {
     try std.testing.expectEqualStrings("app.example.com:8443", security.host);
 }
 
+test "trusted forwarded headers use nearest proxy value" {
+    const peer = try std.Io.net.IpAddress.parse("127.0.0.1", 49152);
+    const security = try requestSecurity(
+        std.testing.allocator,
+        peer,
+        &.{"127.0.0.1"},
+        "127.0.0.1:5173",
+        nearestForwardedValue("http, https"),
+        nearestForwardedValue("attacker.example, app.example.com"),
+        nearestForwardedValue("80, 443"),
+    );
+    defer std.testing.allocator.free(security.host);
+    try std.testing.expect(security.secure);
+    try std.testing.expectEqualStrings("app.example.com", security.host);
+}
+
 test "https redirect location preserves target" {
     const location = try httpsRedirectLocation(std.testing.allocator, "example.com", "/users/42?tab=profile");
     defer std.testing.allocator.free(location);
     try std.testing.expectEqualStrings("https://example.com/users/42?tab=profile", location);
+}
+
+test "https redirect rejects invalid host characters" {
+    const location = try httpsRedirectLocation(std.testing.allocator, "evil.com/path", "/users");
+    defer std.testing.allocator.free(location);
+    try std.testing.expectEqualStrings("https://localhost/users", location);
+}
+
+test "hsts only emits for secure effective requests" {
+    const headers = [_]Header{
+        .{ .name = "accept", .value = "application/json" },
+        .{ .name = "host", .value = "internal:5173" },
+        .{ .name = "x-forwarded-proto", .value = "https" },
+    };
+    var secure_res = try testRequest(std.testing.io, std.testing.allocator, .{
+        .root = ".",
+        .trusted_proxies = &.{"127.0.0.1"},
+        .hsts = true,
+    }, .{ .method = "GET", .target = "/assets/missing.js", .headers = &headers });
+    defer secure_res.deinit(std.testing.allocator);
+    try std.testing.expect(secure_res.header("strict-transport-security") != null);
+
+    var plain_res = try testRequest(std.testing.io, std.testing.allocator, .{
+        .root = ".",
+        .hsts = true,
+    }, .{ .method = "GET", .target = "/assets/missing.js", .headers = &headers });
+    defer plain_res.deinit(std.testing.allocator);
+    try std.testing.expect(plain_res.header("strict-transport-security") == null);
+}
+
+test "multipart parser enforces upload limits" {
+    const body =
+        "--yaan\r\n" ++
+        "Content-Disposition: form-data; name=\"photo\"; filename=\"avatar.png\"\r\n" ++
+        "Content-Type: image/png\r\n" ++
+        "\r\n" ++
+        "PNGDATA\r\n" ++
+        "--yaan--\r\n";
+    try std.testing.expectError(error.PayloadTooLarge, parseMultipart(std.testing.io, std.testing.allocator, body, "yaan", .{ .max_upload_count = 0 }));
+    try std.testing.expectError(error.PayloadTooLarge, parseMultipart(std.testing.io, std.testing.allocator, body, "yaan", .{ .max_upload_file_length = 4 }));
+}
+
+test "signed cookies and csrf validation reject tampering" {
+    const allocator = std.testing.allocator;
+    const secret = "test-secret";
+    const signed = try signedCookieValue(allocator, "session", "abc123", secret);
+    defer allocator.free(signed);
+    const verified = (try verifySignedCookie(allocator, "session", signed, secret)).?;
+    defer allocator.free(verified);
+    try std.testing.expectEqualStrings("abc123", verified);
+    try std.testing.expect((try verifySignedCookie(allocator, "session", "bad.value", secret)) == null);
+
+    const csrf = try signedCookieValue(allocator, "yaan_csrf", "nonce", secret);
+    defer allocator.free(csrf);
+    const cookie = try std.fmt.allocPrint(allocator, "yaan_csrf={s}", .{csrf});
+    defer allocator.free(cookie);
+    const headers = [_]Header{
+        .{ .name = "cookie", .value = cookie },
+        .{ .name = "x-csrf-token", .value = csrf },
+    };
+    try std.testing.expect(validCsrfForRequest(allocator, &headers, "", secret));
+    const bad_headers = [_]Header{
+        .{ .name = "cookie", .value = cookie },
+        .{ .name = "x-csrf-token", .value = "bad" },
+    };
+    try std.testing.expect(!validCsrfForRequest(allocator, &bad_headers, "", secret));
 }

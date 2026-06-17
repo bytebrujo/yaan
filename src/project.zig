@@ -39,11 +39,15 @@ const AssetEntry = struct {
     logical: []u8,
     output: []u8,
     url: []u8,
+    hash: [16]u8,
+    size: usize,
+    inline_data: ?[]u8 = null,
 
     fn deinit(self: *AssetEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.logical);
         allocator.free(self.output);
         allocator.free(self.url);
+        if (self.inline_data) |data| allocator.free(data);
     }
 };
 
@@ -420,8 +424,23 @@ pub fn buildDevHookRunner(io: std.Io, allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn writeExampleApp(io: std.Io, allocator: std.mem.Allocator) !void {
-    const cwd = std.Io.Dir.cwd();
+pub fn writeExampleApp(io: std.Io, allocator: std.mem.Allocator, project_name: ?[]const u8) !void {
+    const base = std.Io.Dir.cwd();
+    // When a name is given, scaffold into a fresh `<name>/` directory
+    // (sv-create style); otherwise scaffold into the current directory.
+    var project_dir: ?std.Io.Dir = null;
+    defer if (project_dir) |*d| d.close(io);
+    const cwd: std.Io.Dir = if (project_name) |name| blk: {
+        if (base.access(io, name, .{})) |_| {
+            std.debug.print("'{s}' already exists; choose a new name or remove it\n", .{name});
+            return error.PathAlreadyExists;
+        } else |_| {}
+        try base.createDirPath(io, name);
+        const dir = try base.openDir(io, name, .{});
+        project_dir = dir;
+        break :blk dir;
+    } else base;
+
     try cwd.createDirPath(io, "src/routes");
     try cwd.createDirPath(io, "src/routes/blog/[slug:string]");
     try cwd.createDirPath(io, "src/routes/login");
@@ -610,7 +629,93 @@ pub fn writeExampleApp(io: std.Io, allocator: std.mem.Allocator) !void {
         \\    };
         \\}
     });
-    _ = allocator;
+
+    try writeProjectBuildFiles(io, allocator, cwd, project_name orelse "app");
+}
+
+/// Emits `build.zig` and `build.zig.zon` for a scaffolded app. The dev/build/
+/// check loop is driven by the global `yaan` CLI and needs no package
+/// dependency, so these are thin wrappers plus a valid package manifest. Files
+/// that already exist are left untouched so re-running init never clobbers a
+/// user's build setup.
+fn writeProjectBuildFiles(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, raw_name: []const u8) !void {
+    const name = try packageName(allocator, raw_name);
+    defer allocator.free(name);
+
+    if (dir.access(io, "build.zig", .{})) |_| {
+        std.debug.print("build.zig exists; leaving it untouched\n", .{});
+    } else |_| {
+        try dir.writeFile(io, .{ .sub_path = "build.zig", .data =
+            \\const std = @import("std");
+            \\
+            \\// Yaan apps are driven by the `yaan` CLI (install it once, then it is on
+            \\// your PATH). The dev/build/check loop is self-contained: the CLI
+            \\// generates everything under .yaan/ and dist/, so no package dependency
+            \\// is required here. These steps are thin wrappers so `zig build dev`
+            \\// works alongside `yaan dev`.
+            \\pub fn build(b: *std.Build) void {
+            \\    const host = b.option([]const u8, "host", "Dev server host") orelse "127.0.0.1";
+            \\    const port = b.option([]const u8, "port", "Dev server port") orelse "5173";
+            \\
+            \\    const dev = b.step("dev", "Run the Yaan dev server");
+            \\    dev.dependOn(&b.addSystemCommand(&.{ "yaan", "dev", "--host", host, "--port", port }).step);
+            \\
+            \\    const check = b.step("check", "Run Yaan framework checks");
+            \\    check.dependOn(&b.addSystemCommand(&.{ "yaan", "check" }).step);
+            \\
+            \\    const build_app = b.step("build-app", "Build the app into dist/");
+            \\    build_app.dependOn(&b.addSystemCommand(&.{ "yaan", "build", "--out", "dist" }).step);
+            \\}
+            \\
+        });
+    }
+
+    if (dir.access(io, "build.zig.zon", .{})) |_| {
+        std.debug.print("build.zig.zon exists; leaving it untouched\n", .{});
+    } else |_| {
+        // Fingerprint layout (validated by the Zig compiler): the high 32 bits
+        // are Crc32(name); the low 32 bits are an arbitrary non-reserved id.
+        const checksum: u32 = std.hash.Crc32.hash(name);
+        var id: u32 = @truncate(std.hash.Wyhash.hash(0, name));
+        if (id == 0) id = 1;
+        if (id == 0xffff_ffff) id = 0xffff_fffe;
+        const fingerprint: u64 = (@as(u64, checksum) << 32) | id;
+
+        const zon = try std.fmt.allocPrint(allocator,
+            \\.{{
+            \\    .name = .{s},
+            \\    .version = "0.0.0",
+            \\    .fingerprint = 0x{x},
+            \\    .minimum_zig_version = "0.16.0",
+            \\    .dependencies = .{{}},
+            \\    .paths = .{{
+            \\        "build.zig",
+            \\        "build.zig.zon",
+            \\        "src",
+            \\        "static",
+            \\    }},
+            \\}}
+            \\
+        , .{ name, fingerprint });
+        defer allocator.free(zon);
+        try dir.writeFile(io, .{ .sub_path = "build.zig.zon", .data = zon });
+    }
+}
+
+/// Sanitizes a project name into a valid Zig identifier usable as the `.name`
+/// enum literal in build.zig.zon. Non-identifier bytes become `_`; a leading
+/// digit is prefixed with `_`.
+fn packageName(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (raw) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        try out.append(allocator, if (ok) c else '_');
+    }
+    if (out.items.len == 0 or (out.items[0] >= '0' and out.items[0] <= '9')) {
+        try out.insert(allocator, 0, '_');
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn discoverRoutes(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(router.RoutePattern) {
@@ -1334,6 +1439,8 @@ fn discoverAssets(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(Asset
             .logical = try allocator.dupe(u8, entry.path),
             .output = output,
             .url = url,
+            .hash = hash,
+            .size = data.len,
         });
     }
     return assets;
@@ -1370,13 +1477,18 @@ fn writeAssetManifestArtifacts(io: std.Io, allocator: std.mem.Allocator, out_dir
     if (out_dir) |dir| {
         const json_source = try assetsJsonSource(allocator, assets);
         defer allocator.free(json_source);
-        const js_source = try assetsJsSource(allocator, json_source);
+        const manifest_source = try assetsManifestJsonSource(allocator, assets);
+        defer allocator.free(manifest_source);
+        const js_source = try assetsJsSource(allocator, json_source, manifest_source);
         defer allocator.free(js_source);
         const json_path = try joinPath(allocator, dir, "assets.json");
         defer allocator.free(json_path);
+        const manifest_path = try joinPath(allocator, dir, "assets.manifest.json");
+        defer allocator.free(manifest_path);
         const js_path = try joinPath(allocator, dir, "assets.js");
         defer allocator.free(js_path);
         try cwd.writeFile(io, .{ .sub_path = json_path, .data = json_source });
+        try cwd.writeFile(io, .{ .sub_path = manifest_path, .data = manifest_source });
         try cwd.writeFile(io, .{ .sub_path = js_path, .data = js_source });
     }
 }
@@ -1648,6 +1760,17 @@ fn generateHookSupport(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\}
         \\
+        \\/// Canonical correlation id for an unexpected error: a stable hash of the
+        \\/// error name and request path. Shared by every transport (in-process
+        \\/// server and subprocess runners) so the same failure yields the same id
+        \\/// in logs and in the response body.
+        \\pub fn errorId(allocator: std.mem.Allocator, err: anyerror, path: []const u8) ![]const u8 {
+        \\    var hasher = std.hash.Wyhash.init(0);
+        \\    hasher.update(@errorName(err));
+        \\    hasher.update(path);
+        \\    return try std.fmt.allocPrint(allocator, "err-{x}", .{hasher.final()});
+        \\}
+        \\
         \\pub fn defaultOnError(ctx: *ErrorContext) Response {
         \\    std.debug.print("unexpected hook error {s} for {s} {s}; id={s}\n", .{ @errorName(ctx.err), ctx.request.method, ctx.request.path, ctx.id });
         \\    return errorResponse(ctx.allocator, .internal_server_error, .{
@@ -1725,7 +1848,7 @@ fn generateHookRunner(allocator: std.mem.Allocator) ![]u8 {
         \\        .locals = .{},
         \\    };
         \\    const decision = app_hooks.handle(&ctx) catch |err| {
-        \\        const id = try errorId(allocator, err, request.path);
+        \\        const id = try hooks.errorId(allocator, err, request.path);
         \\        var error_ctx = hooks.ErrorContext{
         \\            .allocator = allocator,
         \\            .request = request,
@@ -1739,13 +1862,6 @@ fn generateHookRunner(allocator: std.mem.Allocator) ![]u8 {
         \\    };
         \\    try writeDecision(writer, decision);
         \\    try writer.flush();
-        \\}
-        \\
-        \\fn errorId(allocator: std.mem.Allocator, err: anyerror, path: []const u8) ![]const u8 {
-        \\    var hasher = std.hash.Wyhash.init(0);
-        \\    hasher.update(@errorName(err));
-        \\    hasher.update(path);
-        \\    return try std.fmt.allocPrint(allocator, "err-{x}", .{hasher.final()});
         \\}
         \\
         \\fn queryPart(target: []const u8) []const u8 {
@@ -2769,15 +2885,47 @@ fn assetsJsonSource(allocator: std.mem.Allocator, assets: []const AssetEntry) ![
     return out.toOwnedSlice(allocator);
 }
 
-fn assetsJsSource(allocator: std.mem.Allocator, manifest_json: []const u8) ![]u8 {
+fn assetsManifestJsonSource(allocator: std.mem.Allocator, assets: []const AssetEntry) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(allocator, '[');
+    for (assets, 0..) |asset_entry, i| {
+        if (i > 0) try out.append(allocator, ',');
+        const logical = try jsonString(allocator, asset_entry.logical);
+        defer allocator.free(logical);
+        const url = try jsonString(allocator, asset_entry.url);
+        defer allocator.free(url);
+        const output = try jsonString(allocator, asset_entry.output);
+        defer allocator.free(output);
+        const inline_json = if (asset_entry.inline_data) |data| try jsonString(allocator, data) else try allocator.dupe(u8, "null");
+        defer allocator.free(inline_json);
+        try out.print(allocator, "{{\"logical\":{s},\"path\":{s},\"output\":{s},\"hash\":\"{s}\",\"size\":{d},\"inline\":{s}}}", .{
+            logical,
+            url,
+            output,
+            asset_entry.hash,
+            asset_entry.size,
+            inline_json,
+        });
+    }
+    try out.append(allocator, ']');
+    try out.append(allocator, '\n');
+    return out.toOwnedSlice(allocator);
+}
+
+fn assetsJsSource(allocator: std.mem.Allocator, manifest_json: []const u8, metadata_json: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\export const assets = {s};
+        \\export const assetManifest = {s};
         \\export function asset(name) {{
         \\  const key = String(name).startsWith('/') ? String(name).slice(1) : String(name);
         \\  return assets[key] ?? assets[String(name)] ?? name;
         \\}}
+        \\export function assetEntry(name) {{
+        \\  const key = String(name).startsWith('/') ? String(name).slice(1) : String(name);
+        \\  return assetManifest.find((entry) => entry.logical === key || entry.logical === String(name)) ?? null;
+        \\}}
         \\
-    , .{std.mem.trim(u8, manifest_json, " \t\r\n")});
+    , .{ std.mem.trim(u8, manifest_json, " \t\r\n"), std.mem.trim(u8, metadata_json, " \t\r\n") });
 }
 
 fn assetsZigSource(allocator: std.mem.Allocator, assets: []const AssetEntry) ![]u8 {
@@ -2788,6 +2936,10 @@ fn assetsZigSource(allocator: std.mem.Allocator, assets: []const AssetEntry) ![]
         \\pub const Entry = struct {
         \\    logical: []const u8,
         \\    path: []const u8,
+        \\    output: []const u8,
+        \\    hash: []const u8,
+        \\    size: usize,
+        \\    inline_data: ?[]const u8 = null,
         \\};
         \\
         \\pub const manifest = [_]Entry{
@@ -2798,7 +2950,11 @@ fn assetsZigSource(allocator: std.mem.Allocator, assets: []const AssetEntry) ![]
         defer allocator.free(logical);
         const url = try zigString(allocator, asset_entry.url);
         defer allocator.free(url);
-        try out.print(allocator, "    .{{ .logical = {s}, .path = {s} }},\n", .{ logical, url });
+        const output = try zigString(allocator, asset_entry.output);
+        defer allocator.free(output);
+        const inline_data = if (asset_entry.inline_data) |data| try zigString(allocator, data) else try allocator.dupe(u8, "null");
+        defer allocator.free(inline_data);
+        try out.print(allocator, "    .{{ .logical = {s}, .path = {s}, .output = {s}, .hash = \"{s}\", .size = {d}, .inline_data = {s} }},\n", .{ logical, url, output, asset_entry.hash, asset_entry.size, inline_data });
     }
     try out.appendSlice(allocator,
         \\};
@@ -2809,6 +2965,14 @@ fn assetsZigSource(allocator: std.mem.Allocator, assets: []const AssetEntry) ![]
         \\        if (std.mem.eql(u8, entry.logical, key) or std.mem.eql(u8, entry.logical, logical)) return entry.path;
         \\    }
         \\    return logical;
+        \\}
+        \\
+        \\pub fn assetEntry(logical: []const u8) ?Entry {
+        \\    const key = if (logical.len > 0 and logical[0] == '/') logical[1..] else logical;
+        \\    for (manifest) |entry| {
+        \\        if (std.mem.eql(u8, entry.logical, key) or std.mem.eql(u8, entry.logical, logical)) return entry;
+        \\    }
+        \\    return null;
         \\}
         \\
     );
@@ -2871,12 +3035,18 @@ test "asset manifest helpers emit hashed assets" {
         .logical = try std.testing.allocator.dupe(u8, "icons/logo.svg"),
         .output = try std.testing.allocator.dupe(u8, output),
         .url = try std.testing.allocator.dupe(u8, "/assets/icons/logo.abc.svg"),
+        .hash = hash,
+        .size = 5,
     }};
     defer entries[0].deinit(std.testing.allocator);
     const json = try assetsJsonSource(std.testing.allocator, &entries);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"icons/logo.svg\"") != null);
-    const js = try assetsJsSource(std.testing.allocator, json);
+    const metadata = try assetsManifestJsonSource(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(metadata);
+    try std.testing.expect(std.mem.indexOf(u8, metadata, "\"size\":5") != null);
+    const js = try assetsJsSource(std.testing.allocator, json, metadata);
     defer std.testing.allocator.free(js);
     try std.testing.expect(std.mem.indexOf(u8, js, "export function asset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js, "export const assetManifest") != null);
 }

@@ -55,6 +55,10 @@ const AssetEntry = struct {
     hash: [16]u8,
     size: usize,
     inline_data: ?[]u8 = null,
+    /// How many components/layouts reference this asset via `asset("...")`.
+    /// Counted during `phaseAnalyze`; `refs == 0` assets are warned about and
+    /// pruned from the install (§4).
+    refs: u32 = 0,
 
     fn deinit(self: *AssetEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.logical);
@@ -116,17 +120,38 @@ const Stage = enum(u8) { init, scanned, parsed, analyzed, emitted, rendered };
 /// `Build.deinit`, so the source is parsed once and `phaseRender` reuses it.
 const RouteNode = struct {
     index: usize,
+    /// Owns this node's source buffer and parsed component. Backed by the
+    /// thread-safe page allocator so each parse job (§6) allocates without
+    /// contending on a shared allocator; freed wholesale at `deinit`.
+    arena: std.heap.ArenaAllocator,
     source: []const u8 = "",
     component: parser.Component = .{ .source = "" },
     parsed: bool = false,
+    /// Set by a parse job that failed; surfaced after the parse barrier since
+    /// `std.Io.Group` swallows task errors.
+    err: ?anyerror = null,
 
-    fn deinit(self: *RouteNode, allocator: std.mem.Allocator) void {
-        if (self.parsed) {
-            parser.deinitComponent(&self.component, allocator);
-            allocator.free(self.source);
-        }
+    fn deinit(self: *RouteNode) void {
+        self.arena.deinit();
     }
 };
+
+/// Parse one route into its own arena. Runs on a worker thread under
+/// `std.Io.Group`, which discards the return value, so failures are recorded on
+/// `node.err` for the caller to surface after the barrier.
+fn parseRouteNode(node: *RouteNode, io: std.Io, file: []const u8) void {
+    const allocator = node.arena.allocator();
+    const source = std.Io.Dir.cwd().readFileAlloc(io, file, allocator, .limited(4 * 1024 * 1024)) catch |e| {
+        node.err = e;
+        return;
+    };
+    node.component = parser.parse(allocator, source) catch |e| {
+        node.err = e;
+        return;
+    };
+    node.source = source;
+    node.parsed = true;
+}
 
 /// A layout deduplicated by source path, parsed once and shared by every route
 /// whose chain includes it. `module`/`skeleton` are filled during `phaseRender`.
@@ -162,6 +187,7 @@ const Build = struct {
     diags: diagnostics.Bag,
     routes: std.ArrayList(router.RoutePattern) = .empty,
     remotes: std.ArrayList(RemoteFunction) = .empty,
+    assets: std.ArrayList(AssetEntry) = .empty,
     nodes: []RouteNode = &.{},
     layouts: std.ArrayList(LayoutNode) = .empty,
     stage: Stage = .init,
@@ -171,12 +197,13 @@ const Build = struct {
     }
 
     fn deinit(self: *Build) void {
-        for (self.nodes) |*n| n.deinit(self.gpa);
+        for (self.nodes) |*n| n.deinit();
         self.gpa.free(self.nodes);
         for (self.layouts.items) |*l| l.deinit(self.gpa);
         self.layouts.deinit(self.gpa);
         deinitRoutes(&self.routes, self.gpa);
         deinitRemotes(&self.remotes, self.gpa);
+        deinitAssets(&self.assets, self.gpa);
         self.diags.deinit();
     }
 
@@ -213,6 +240,7 @@ const Build = struct {
     fn phaseScan(self: *Build) !void {
         self.routes = try discoverRoutes(self.io, self.gpa, &self.diags);
         self.remotes = try discoverRemotes(self.io, self.gpa);
+        self.assets = try discoverAssets(self.io, self.gpa);
         self.advance(.init, .scanned);
     }
 
@@ -221,16 +249,20 @@ const Build = struct {
     fn phaseParse(self: *Build) !void {
         const cwd = std.Io.Dir.cwd();
         const nodes = try self.gpa.alloc(RouteNode, self.routes.items.len);
-        for (nodes, 0..) |*n, i| n.* = .{ .index = i };
-        self.nodes = nodes; // assign before parsing so Build.deinit reclaims it
+        for (nodes, 0..) |*n, i| n.* = .{ .index = i, .arena = .init(std.heap.page_allocator) };
+        self.nodes = nodes; // assign before parsing so Build.deinit reclaims arenas
+        // §6: parse every route concurrently. Each job writes only its own node
+        // (into that node's arena), so there is no shared mutable state; errors
+        // are collected after the barrier since Group discards task results.
+        var group: std.Io.Group = .init;
         for (self.nodes) |*node| {
-            const route = self.routes.items[node.index];
-            const source = try cwd.readFileAlloc(self.io, route.file, self.gpa, .limited(4 * 1024 * 1024));
-            errdefer self.gpa.free(source);
-            node.component = try parser.parse(self.gpa, source);
-            node.source = source;
-            node.parsed = true;
+            group.async(self.io, parseRouteNode, .{ node, self.io, self.routes.items[node.index].file });
         }
+        group.await(self.io) catch {};
+        for (self.nodes) |*node| {
+            if (node.err) |err| return err;
+        }
+        // Layouts (deduped, far fewer) stay serial on the build allocator.
         for (self.routes.items) |route| {
             for (route.layouts) |layout| {
                 if (self.findLayout(layout.file) != null) continue;
@@ -265,6 +297,13 @@ const Build = struct {
             try collectParseDiagnostics(&self.diags, layout.file, &layout.component);
             try validateLayoutSlots(&self.diags, layout.file, &layout.component);
         }
+        // §4: reference-count assets across every page + layout source and every
+        // Zig sidecar, then warn about (and later prune) any that nothing
+        // references via asset().
+        for (self.nodes) |*node| countAssetReferences(self.assets.items, node.component.source);
+        for (self.layouts.items) |*layout| countAssetReferences(self.assets.items, layout.component.source);
+        try countZigAssetReferences(self.io, self.gpa, self.assets.items);
+        try warnUnreferencedAssets(&self.diags, self.gpa, self.assets.items);
         self.advance(.parsed, .analyzed);
     }
 
@@ -273,7 +312,7 @@ const Build = struct {
     /// shims, which print their own compiler output) feed the shared error tally via
     /// `noteExternal` rather than being re-rendered.
     fn phaseEmit(self: *Build) !void {
-        try prepareAssetArtifacts(self.io, self.gpa, self.out_dir);
+        try prepareAssetArtifacts(self.io, self.gpa, self.out_dir, self.assets.items);
         self.diags.noteExternal(try prepareEnvArtifacts(self.io, self.gpa, self.out_dir));
         if (self.errorCount() == 0) {
             self.diags.noteExternal(try prepareHookArtifacts(self.io, self.gpa));
@@ -1889,11 +1928,45 @@ fn prepareHookArtifacts(io: std.Io, allocator: std.mem.Allocator) !usize {
     return try runHookTypeCheck(io, allocator);
 }
 
-fn prepareAssetArtifacts(io: std.Io, allocator: std.mem.Allocator, out_dir: ?[]const u8) !void {
-    var assets = try discoverAssets(io, allocator);
-    defer deinitAssets(&assets, allocator);
-    if (out_dir) |dir| try writeBuiltAssets(io, allocator, dir, assets.items);
-    try writeAssetManifestArtifacts(io, allocator, out_dir, assets.items);
+/// Install and manifest only referenced assets (refs > 0); orphans are pruned
+/// (§4). When any asset is pruned in build mode, a `dist/assets.unreferenced.json`
+/// records them so the dev server can give an "exists but unreferenced" 404.
+fn prepareAssetArtifacts(io: std.Io, allocator: std.mem.Allocator, out_dir: ?[]const u8, assets: []const AssetEntry) !void {
+    var referenced: std.ArrayList(AssetEntry) = .empty;
+    defer referenced.deinit(allocator); // shallow view; entries are owned by `assets`
+    var pruned: usize = 0;
+    for (assets) |entry| {
+        if (entry.refs > 0) try referenced.append(allocator, entry) else pruned += 1;
+    }
+    if (out_dir) |dir| try writeBuiltAssets(io, allocator, dir, referenced.items);
+    try writeAssetManifestArtifacts(io, allocator, out_dir, referenced.items);
+    if (out_dir) |dir| {
+        if (pruned > 0) try writeUnreferencedManifest(io, allocator, dir, assets);
+    }
+}
+
+/// Record pruned assets (logical name + would-be url) for the dev server. Written
+/// only when at least one asset was pruned, so a fully-referenced app's `dist/` is
+/// unchanged.
+fn writeUnreferencedManifest(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, assets: []const AssetEntry) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var first = true;
+    for (assets) |entry| {
+        if (entry.refs > 0) continue;
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        const logical = try jsonString(allocator, entry.logical);
+        defer allocator.free(logical);
+        const url = try jsonString(allocator, entry.url);
+        defer allocator.free(url);
+        try out.print(allocator, "{{\"logical\":{s},\"url\":{s}}}", .{ logical, url });
+    }
+    try out.append(allocator, ']');
+    const path = try joinPath(allocator, out_dir, "assets.unreferenced.json");
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
 fn discoverAssets(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(AssetEntry) {
@@ -1934,6 +2007,73 @@ fn discoverAssets(io: std.Io, allocator: std.mem.Allocator) !std.ArrayList(Asset
 fn deinitAssets(assets: *std.ArrayList(AssetEntry), allocator: std.mem.Allocator) void {
     for (assets.items) |*asset_entry| asset_entry.deinit(allocator);
     assets.deinit(allocator);
+}
+
+/// Bump `refs` for every asset named by a static `asset("literal")` call in
+/// `source`. Matching is deliberately liberal (any quoted-literal arg counts):
+/// over-counting only keeps an asset installed, while under-counting would prune
+/// a live one. Dynamic `asset(expr)` calls can't be resolved and are skipped —
+/// the documented limitation of static pruning. CSS `url(...)` is not a Yaan
+/// asset channel, so it is not scanned.
+fn countAssetReferences(assets: []AssetEntry, source: []const u8) void {
+    const needle = "asset(";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, source, i, needle)) |start| {
+        i = start + needle.len;
+        var j = i;
+        while (j < source.len and std.ascii.isWhitespace(source[j])) j += 1;
+        if (j >= source.len) continue;
+        const quote = source[j];
+        if (quote != '"' and quote != '\'') continue; // dynamic arg — can't resolve
+        j += 1;
+        const lit_start = j;
+        while (j < source.len and source[j] != quote) j += 1;
+        if (j >= source.len) break; // unterminated literal
+        const literal = source[lit_start..j];
+        const key = if (literal.len > 0 and literal[0] == '/') literal[1..] else literal;
+        for (assets) |*entry| {
+            if (std.mem.eql(u8, entry.logical, key)) entry.refs +|= 1;
+        }
+        i = j + 1;
+    }
+}
+
+/// Emit a `W_ASSET_UNREFERENCED` warning for every asset that nothing references
+/// (refs == 0) — these are pruned from the install. Warnings don't gate the build.
+fn warnUnreferencedAssets(bag: *diagnostics.Bag, allocator: std.mem.Allocator, assets: []const AssetEntry) !void {
+    for (assets) |entry| {
+        if (entry.refs != 0) continue;
+        const path = try std.fmt.allocPrint(allocator, "static/{s}", .{entry.logical});
+        defer allocator.free(path);
+        try bag.add(.{
+            .severity = .warning,
+            .file = path,
+            .code = "W_ASSET_UNREFERENCED",
+            .message = "asset is never referenced via asset() and will not be installed",
+        });
+    }
+}
+
+/// Scan every `.zig` sidecar under `src/` for `asset("literal")` references too,
+/// so an asset used only from a loader/action/remote/hook (via the generated
+/// `assets` module) is not mistaken for an orphan and pruned.
+fn countZigAssetReferences(io: std.Io, allocator: std.mem.Allocator, assets: []AssetEntry) !void {
+    const cwd = std.Io.Dir.cwd();
+    var src_dir = cwd.openDir(io, "src", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer src_dir.close(io);
+    var walker = try src_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        const path = try joinPath(allocator, "src", entry.path);
+        defer allocator.free(path);
+        const source = try cwd.readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(source);
+        countAssetReferences(assets, source);
+    }
 }
 
 fn writeBuiltAssets(io: std.Io, allocator: std.mem.Allocator, out_dir: []const u8, assets: []const AssetEntry) !void {
@@ -3787,6 +3927,82 @@ test "pipeline emits E_BAD_PARAM_TYPE and gates emit/render on a bad route param
     try std.testing.expect(found);
     // Emit and render never ran: the build never advanced past analyze.
     try std.testing.expectEqual(Stage.analyzed, build.stage);
+}
+
+test "countAssetReferences counts static asset() calls and skips dynamic args" {
+    var assets = [_]AssetEntry{
+        .{ .logical = @constCast("logo.svg"), .output = @constCast(""), .url = @constCast(""), .hash = undefined, .size = 0 },
+        .{ .logical = @constCast("orphan.txt"), .output = @constCast(""), .url = @constCast(""), .hash = undefined, .size = 0 },
+    };
+    const source =
+        \\<img src={asset("logo.svg")} />
+        \\<a href={asset( '/logo.svg' )}>x</a>
+        \\const u = asset(dynamicName);
+    ;
+    countAssetReferences(&assets, source);
+    // Double-quoted + single-quoted (leading slash normalized) both match; the
+    // dynamic asset(expr) call is skipped.
+    try std.testing.expectEqual(@as(u32, 2), assets[0].refs);
+    try std.testing.expectEqual(@as(u32, 0), assets[1].refs);
+}
+
+test "warnUnreferencedAssets warns once per orphan" {
+    const a = std.testing.allocator;
+    const assets = [_]AssetEntry{
+        .{ .logical = @constCast("used.svg"), .output = @constCast(""), .url = @constCast(""), .hash = undefined, .size = 0, .refs = 1 },
+        .{ .logical = @constCast("orphan.txt"), .output = @constCast(""), .url = @constCast(""), .hash = undefined, .size = 0, .refs = 0 },
+    };
+    var bag = diagnostics.Bag.init(a);
+    defer bag.deinit();
+    try warnUnreferencedAssets(&bag, a, &assets);
+    try std.testing.expectEqual(@as(usize, 0), bag.errorCount());
+    try std.testing.expectEqual(@as(usize, 1), bag.warningCount());
+    try std.testing.expectEqualStrings("W_ASSET_UNREFERENCED", bag.items.items[0].code);
+    try std.testing.expectEqualStrings("static/orphan.txt", bag.items.items[0].file);
+}
+
+test "prepareAssetArtifacts installs only referenced assets and records orphans" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "static");
+    try tmp.dir.writeFile(io, .{ .sub_path = "static/used.txt", .data = "used" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "static/orphan.txt", .data = "orphan" });
+
+    var orig = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer orig.close(io);
+    const tmp_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(tmp_path);
+    try std.Io.Threaded.chdir(tmp_path);
+    defer std.Io.Threaded.fchdir(orig.handle) catch {};
+
+    var assets = try discoverAssets(io, a);
+    defer deinitAssets(&assets, a);
+    try std.testing.expectEqual(@as(usize, 2), assets.items.len);
+    for (assets.items) |*e| {
+        if (std.mem.eql(u8, e.logical, "used.txt")) e.refs = 1; // orphan.txt stays 0
+    }
+
+    try prepareAssetArtifacts(io, a, "dist", assets.items);
+
+    const cwd = std.Io.Dir.cwd();
+    for (assets.items) |e| {
+        const installed_path = try joinPath(a, "dist", e.output);
+        defer a.free(installed_path);
+        const installed = if (cwd.access(io, installed_path, .{})) true else |_| false;
+        if (std.mem.eql(u8, e.logical, "used.txt")) {
+            try std.testing.expect(installed); // referenced -> installed
+        } else {
+            try std.testing.expect(!installed); // orphan -> pruned
+        }
+    }
+
+    const unref = try cwd.readFileAlloc(io, "dist/assets.unreferenced.json", a, .limited(64 * 1024));
+    defer a.free(unref);
+    try std.testing.expect(std.mem.indexOf(u8, unref, "orphan.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unref, "used.txt") == null);
 }
 
 test "layout chain resolution follows directory nesting" {

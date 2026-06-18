@@ -338,6 +338,9 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\function stringifyData(value) { return value === undefined ? undefined : JSON.stringify(value); }
         \\let formResult = null;
         \\let activeHistoryKey = null;
+        \\// Monotonic per-entry index used only on the popstate fallback path to tell
+        \\// back from forward; the Navigation API path reads native entry indices.
+        \\let activeHistoryIndex = 0;
         \\let canHydrate = outlet ? outlet.dataset.yaanPrerendered === 'true' : false;
         \\if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
         \\
@@ -351,12 +354,20 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  return state && typeof state.ynKey === 'string' ? state.ynKey : null;
         \\}
         \\
+        \\function historyIndex() {
+        \\  const state = history.state;
+        \\  return state && typeof state.ynIndex === 'number' ? state.ynIndex : null;
+        \\}
+        \\
         \\function ensureHistoryKey() {
         \\  const existing = historyKey();
-        \\  if (existing) return existing;
-        \\  const key = newHistoryKey();
-        \\  const state = { ...(history.state || {}), ynKey: key };
+        \\  const existingIndex = historyIndex();
+        \\  if (existing && existingIndex !== null) { activeHistoryIndex = existingIndex; return existing; }
+        \\  const key = existing || newHistoryKey();
+        \\  const index = existingIndex !== null ? existingIndex : activeHistoryIndex;
+        \\  const state = { ...(history.state || {}), ynKey: key, ynIndex: index };
         \\  history.replaceState(state, '', location.href);
+        \\  activeHistoryIndex = index;
         \\  return key;
         \\}
         \\
@@ -436,13 +447,48 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\function focusOutlet() {
         \\  if (outlet && typeof outlet.focus === 'function') outlet.focus({ preventScroll: true });
         \\}
-        \\function swap(mutate, animate) {
+        \\function swap(mutate, animate, types) {
         \\  if (animate && typeof document.startViewTransition === 'function') {
-        \\    return document.startViewTransition(mutate).finished.catch(() => {});
+        \\    let transition;
+        \\    try {
+        \\      transition = types && types.length
+        \\        ? document.startViewTransition({ update: mutate, types })
+        \\        : document.startViewTransition(mutate);
+        \\    } catch (error) {
+        \\      // Engines that predate the typed object signature reject it at the
+        \\      // bindings layer; fall back to a plain (untyped) transition.
+        \\      transition = document.startViewTransition(mutate);
+        \\    }
+        \\    return transition.finished.catch(() => {});
         \\  }
         \\  return Promise.resolve().then(mutate);
         \\}
         \\const prefetched = new Set();
+        \\// Hover/focus-warmed loader payloads keyed by pathname. Entries are
+        \\// single-use (consumed and deleted by the matching navigation) and
+        \\// TTL-bounded, so a click that lands after the data went stale refetches
+        \\// instead of serving it. Capped to avoid unbounded growth from idle hover.
+        \\const dataCache = new Map();
+        \\const DATA_TTL = 5000;
+        \\const DATA_CACHE_MAX = 16;
+        \\function loadData(pathname) {
+        \\  return fetch('/_yaan/load?path=' + encodeURIComponent(pathname)).then(r => r.json());
+        \\}
+        \\function prefetchData(pathname) {
+        \\  const existing = dataCache.get(pathname);
+        \\  if (existing && (Date.now() - existing.at) < DATA_TTL) return;
+        \\  if (dataCache.size >= DATA_CACHE_MAX) dataCache.delete(dataCache.keys().next().value);
+        \\  dataCache.set(pathname, { at: Date.now(), promise: loadData(pathname).catch(() => null) });
+        \\}
+        \\function takeData(pathname) {
+        \\  const cached = dataCache.get(pathname);
+        \\  dataCache.delete(pathname);
+        \\  if (cached && (Date.now() - cached.at) < DATA_TTL) {
+        \\    // A prefetch that errored resolves to null; refetch rather than serve it.
+        \\    return cached.promise.then(value => value == null ? loadData(pathname) : value);
+        \\  }
+        \\  return loadData(pathname);
+        \\}
         \\function routeChainUrls(route) { return [...(route.layouts || []), route.module]; }
         \\function prefetchRoute(pathname) {
         \\  const found = match(pathname);
@@ -452,6 +498,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\    prefetched.add(url);
         \\    import(url).catch(() => prefetched.delete(url));
         \\  }
+        \\  prefetchData(pathname);
         \\}
         \\function escapeRe(value) {
         \\  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -493,6 +540,8 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\async function render(options = {}) {
         \\  const restore = options.restoreSnapshot !== false;
         \\  const animate = options.animate === true;
+        \\  // Forward/backward feed the :active-view-transition-type() CSS hooks.
+        \\  const types = animate && options.direction ? [options.direction] : undefined;
         \\  activeHistoryKey = ensureHistoryKey();
         \\  const found = match(location.pathname);
         \\  if (!found) {
@@ -503,7 +552,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\      currentRoute = null;
         \\      outlet.replaceChildren();
         \\      outlet.textContent = '404';
-        \\    }, animate);
+        \\    }, animate, types);
         \\    canHydrate = false;
         \\    document.title = 'Not found';
         \\    announce('Not found');
@@ -512,7 +561,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  }
         \\  const chainUrls = routeChainUrls(found.route);
         \\  const [loaded, mods] = await Promise.all([
-        \\    fetch('/_yaan/load?path=' + encodeURIComponent(location.pathname)).then(r => r.json()).catch(() => found.params),
+        \\    takeData(location.pathname).catch(() => found.params),
         \\    Promise.all(chainUrls.map(url => import(url))),
         \\  ]);
         \\  // Layout loads compose into an envelope; a plain page payload has no layers.
@@ -563,7 +612,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\    currentChainData.length = built;
         \\    currentChainUrls = chainUrls;
         \\    currentRoute = found.route;
-        \\  }, animate && !hydrateNow);
+        \\  }, animate && !hydrateNow, types);
         \\  applyTitle(found.route, pageData);
         \\  if (options.focus !== false) focusOutlet();
         \\  if (options.scroll === 'restore') {
@@ -599,9 +648,10 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  captureSnapshot();
         \\  formResult = null;
         \\  const key = newHistoryKey();
-        \\  history.pushState({ ynKey: key }, '', href);
+        \\  activeHistoryIndex += 1;
+        \\  history.pushState({ ynKey: key, ynIndex: activeHistoryIndex }, '', href);
         \\  activeHistoryKey = key;
-        \\  return render({ animate: true, scroll: 'top' });
+        \\  return render({ animate: true, scroll: 'top', direction: 'forward' });
         \\}
         \\document.addEventListener('submit', event => {
         \\  const form = event.target.closest && event.target.closest('form');
@@ -623,13 +673,18 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\    const url = new URL(event.destination.url);
         \\    if (url.origin !== location.origin) return;
         \\    const traverse = event.navigationType === 'traverse';
+        \\    let direction = 'forward';
+        \\    if (traverse) {
+        \\      const from = navigation.currentEntry ? navigation.currentEntry.index : -1;
+        \\      direction = event.destination.index < from ? 'backward' : 'forward';
+        \\    }
         \\    event.intercept({
         \\      focusReset: 'manual',
         \\      scroll: 'manual',
         \\      handler: async () => {
         \\        if (!traverse) { captureSnapshot(); formResult = null; }
         \\        else { activeHistoryKey = ensureHistoryKey(); }
-        \\        await render({ animate: true, scroll: traverse ? 'restore' : 'top' });
+        \\        await render({ animate: true, scroll: traverse ? 'restore' : 'top', direction });
         \\      },
         \\    });
         \\  });
@@ -644,8 +699,10 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  addEventListener('popstate', () => {
         \\    captureSnapshot();
         \\    formResult = null;
+        \\    const target = historyIndex();
+        \\    const direction = (target !== null && target < activeHistoryIndex) ? 'backward' : 'forward';
         \\    activeHistoryKey = ensureHistoryKey();
-        \\    render({ animate: true, scroll: 'restore' });
+        \\    render({ animate: true, scroll: 'restore', direction });
         \\  });
         \\}
         \\addEventListener('pagehide', () => captureSnapshot());
@@ -803,6 +860,14 @@ pub fn baseCss() []const u8 {
     return
         \\.yaan-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
         \\slot{display:contents;}
+        \\@keyframes yaan-slide-to-left{to{transform:translateX(-20%);opacity:0;}}
+        \\@keyframes yaan-slide-from-right{from{transform:translateX(20%);opacity:0;}}
+        \\@keyframes yaan-slide-to-right{to{transform:translateX(20%);opacity:0;}}
+        \\@keyframes yaan-slide-from-left{from{transform:translateX(-20%);opacity:0;}}
+        \\html:active-view-transition-type(forward)::view-transition-old(root){animation:.25s ease both yaan-slide-to-left;}
+        \\html:active-view-transition-type(forward)::view-transition-new(root){animation:.25s ease both yaan-slide-from-right;}
+        \\html:active-view-transition-type(backward)::view-transition-old(root){animation:.25s ease both yaan-slide-to-right;}
+        \\html:active-view-transition-type(backward)::view-transition-new(root){animation:.25s ease both yaan-slide-from-left;}
         \\@media (prefers-reduced-motion: reduce){::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none !important;}}
         \\
     ;
@@ -1182,7 +1247,7 @@ test "app router emits opt-in snapshot persistence" {
     try std.testing.expect(std.mem.indexOf(u8, app, "function captureSnapshot") != null);
     try std.testing.expect(std.mem.indexOf(u8, app, "function restoreSnapshot") != null);
     try std.testing.expect(std.mem.indexOf(u8, app, "sessionStorage.setItem") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app, "history.pushState({ ynKey: key }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "history.pushState({ ynKey: key,") != null);
 }
 
 test "app router adopts modern navigation, a11y and performance patterns" {
@@ -1200,8 +1265,14 @@ test "app router adopts modern navigation, a11y and performance patterns" {
     try std.testing.expect(std.mem.indexOf(u8, app, "outlet.focus(") != null);
     // P1.4 scroll restoration
     try std.testing.expect(std.mem.indexOf(u8, app, "history.scrollRestoration = 'manual'") != null);
-    // P2.3 prefetch on intent
+    // P2.3 prefetch on intent — modules and loader data are both warmed.
     try std.testing.expect(std.mem.indexOf(u8, app, "function prefetchRoute(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "function prefetchData(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "takeData(location.pathname)") != null);
+    // P3.3 directional view-transition types fed by the navigation direction.
+    try std.testing.expect(std.mem.indexOf(u8, app, "document.startViewTransition({ update: mutate, types })") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "direction: 'forward'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "event.destination.index < from") != null);
     // P2.2 hydration hook
     try std.testing.expect(std.mem.indexOf(u8, app, "mod.hydrate(parent, props)") != null);
     // Layout chain: shared prefix kept, divergent tail rebuilt.

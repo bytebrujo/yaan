@@ -337,6 +337,12 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\function activePage() { return currentChain.length ? currentChain[currentChain.length - 1] : null; }
         \\function stringifyData(value) { return value === undefined ? undefined : JSON.stringify(value); }
         \\let formResult = null;
+        \\// Latest-navigation guard: each render() bumps renderToken and aborts the
+        \\// prior in-flight loader fetch, so a superseded navigation neither writes
+        \\// stale data nor leaves a wasted request running. Prefetch fetches carry no
+        \\// signal, so a navigation can still consume the warm payload hover kicked off.
+        \\let renderToken = 0;
+        \\let loadController = null;
         \\let activeHistoryKey = null;
         \\// Monotonic per-entry index used only on the popstate fallback path to tell
         \\// back from forward; the Navigation API path reads native entry indices.
@@ -471,8 +477,12 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\const dataCache = new Map();
         \\const DATA_TTL = 5000;
         \\const DATA_CACHE_MAX = 16;
-        \\function loadData(pathname) {
-        \\  return fetch('/_yaan/load?path=' + encodeURIComponent(pathname)).then(r => r.json());
+        \\function loadData(pathname, signal) {
+        \\  return fetch('/_yaan/load?path=' + encodeURIComponent(pathname), signal ? { signal } : undefined)
+        \\    // The load endpoint maps a failed loader to a non-2xx status with an
+        \\    // { message, code, id } error body; reject so callers fall back to route
+        \\    // params instead of rendering the error envelope as page data.
+        \\    .then(r => { if (!r.ok) throw new Error('load ' + r.status); return r.json(); });
         \\}
         \\function prefetchData(pathname) {
         \\  const existing = dataCache.get(pathname);
@@ -480,14 +490,14 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  if (dataCache.size >= DATA_CACHE_MAX) dataCache.delete(dataCache.keys().next().value);
         \\  dataCache.set(pathname, { at: Date.now(), promise: loadData(pathname).catch(() => null) });
         \\}
-        \\function takeData(pathname) {
+        \\function takeData(pathname, signal) {
         \\  const cached = dataCache.get(pathname);
         \\  dataCache.delete(pathname);
         \\  if (cached && (Date.now() - cached.at) < DATA_TTL) {
         \\    // A prefetch that errored resolves to null; refetch rather than serve it.
-        \\    return cached.promise.then(value => value == null ? loadData(pathname) : value);
+        \\    return cached.promise.then(value => value == null ? loadData(pathname, signal) : value);
         \\  }
-        \\  return loadData(pathname);
+        \\  return loadData(pathname, signal);
         \\}
         \\function routeChainUrls(route) { return [...(route.layouts || []), route.module]; }
         \\function prefetchRoute(pathname) {
@@ -543,6 +553,11 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  // Forward/backward feed the :active-view-transition-type() CSS hooks.
         \\  const types = animate && options.direction ? [options.direction] : undefined;
         \\  activeHistoryKey = ensureHistoryKey();
+        \\  // Supersede any in-flight navigation load; the newest render wins.
+        \\  const token = ++renderToken;
+        \\  if (loadController) loadController.abort();
+        \\  loadController = new AbortController();
+        \\  const signal = loadController.signal;
         \\  const found = match(location.pathname);
         \\  if (!found) {
         \\    await swap(() => {
@@ -561,9 +576,12 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  }
         \\  const chainUrls = routeChainUrls(found.route);
         \\  const [loaded, mods] = await Promise.all([
-        \\    takeData(location.pathname).catch(() => found.params),
+        \\    takeData(location.pathname, signal).catch(() => found.params),
         \\    Promise.all(chainUrls.map(url => import(url))),
         \\  ]);
+        \\  // A newer navigation started while we awaited; drop this stale result
+        \\  // before it can mutate the DOM or overwrite the live chain.
+        \\  if (token !== renderToken) return;
         \\  // Layout loads compose into an envelope; a plain page payload has no layers.
         \\  let pageData = loaded, layerData = [];
         \\  if (loaded && loaded.__yaan_chain) { pageData = loaded.data; layerData = loaded.layouts || []; }
@@ -1268,7 +1286,14 @@ test "app router adopts modern navigation, a11y and performance patterns" {
     // P2.3 prefetch on intent — modules and loader data are both warmed.
     try std.testing.expect(std.mem.indexOf(u8, app, "function prefetchRoute(") != null);
     try std.testing.expect(std.mem.indexOf(u8, app, "function prefetchData(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app, "takeData(location.pathname)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "takeData(location.pathname, signal)") != null);
+    // Loader fetch rejects on a non-2xx status so the server's error envelope
+    // never gets rendered as page data — it falls back to route params.
+    try std.testing.expect(std.mem.indexOf(u8, app, "if (!r.ok) throw") != null);
+    // Latest-navigation wins: the prior in-flight load is aborted and a stale
+    // result that resolves after a newer navigation is dropped.
+    try std.testing.expect(std.mem.indexOf(u8, app, "loadController.abort()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "if (token !== renderToken) return;") != null);
     // P3.3 directional view-transition types fed by the navigation direction.
     try std.testing.expect(std.mem.indexOf(u8, app, "document.startViewTransition({ update: mutate, types })") != null);
     try std.testing.expect(std.mem.indexOf(u8, app, "direction: 'forward'") != null);

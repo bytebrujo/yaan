@@ -120,17 +120,38 @@ const Stage = enum(u8) { init, scanned, parsed, analyzed, emitted, rendered };
 /// `Build.deinit`, so the source is parsed once and `phaseRender` reuses it.
 const RouteNode = struct {
     index: usize,
+    /// Owns this node's source buffer and parsed component. Backed by the
+    /// thread-safe page allocator so each parse job (§6) allocates without
+    /// contending on a shared allocator; freed wholesale at `deinit`.
+    arena: std.heap.ArenaAllocator,
     source: []const u8 = "",
     component: parser.Component = .{ .source = "" },
     parsed: bool = false,
+    /// Set by a parse job that failed; surfaced after the parse barrier since
+    /// `std.Io.Group` swallows task errors.
+    err: ?anyerror = null,
 
-    fn deinit(self: *RouteNode, allocator: std.mem.Allocator) void {
-        if (self.parsed) {
-            parser.deinitComponent(&self.component, allocator);
-            allocator.free(self.source);
-        }
+    fn deinit(self: *RouteNode) void {
+        self.arena.deinit();
     }
 };
+
+/// Parse one route into its own arena. Runs on a worker thread under
+/// `std.Io.Group`, which discards the return value, so failures are recorded on
+/// `node.err` for the caller to surface after the barrier.
+fn parseRouteNode(node: *RouteNode, io: std.Io, file: []const u8) void {
+    const allocator = node.arena.allocator();
+    const source = std.Io.Dir.cwd().readFileAlloc(io, file, allocator, .limited(4 * 1024 * 1024)) catch |e| {
+        node.err = e;
+        return;
+    };
+    node.component = parser.parse(allocator, source) catch |e| {
+        node.err = e;
+        return;
+    };
+    node.source = source;
+    node.parsed = true;
+}
 
 /// A layout deduplicated by source path, parsed once and shared by every route
 /// whose chain includes it. `module`/`skeleton` are filled during `phaseRender`.
@@ -176,7 +197,7 @@ const Build = struct {
     }
 
     fn deinit(self: *Build) void {
-        for (self.nodes) |*n| n.deinit(self.gpa);
+        for (self.nodes) |*n| n.deinit();
         self.gpa.free(self.nodes);
         for (self.layouts.items) |*l| l.deinit(self.gpa);
         self.layouts.deinit(self.gpa);
@@ -228,16 +249,20 @@ const Build = struct {
     fn phaseParse(self: *Build) !void {
         const cwd = std.Io.Dir.cwd();
         const nodes = try self.gpa.alloc(RouteNode, self.routes.items.len);
-        for (nodes, 0..) |*n, i| n.* = .{ .index = i };
-        self.nodes = nodes; // assign before parsing so Build.deinit reclaims it
+        for (nodes, 0..) |*n, i| n.* = .{ .index = i, .arena = .init(std.heap.page_allocator) };
+        self.nodes = nodes; // assign before parsing so Build.deinit reclaims arenas
+        // §6: parse every route concurrently. Each job writes only its own node
+        // (into that node's arena), so there is no shared mutable state; errors
+        // are collected after the barrier since Group discards task results.
+        var group: std.Io.Group = .init;
         for (self.nodes) |*node| {
-            const route = self.routes.items[node.index];
-            const source = try cwd.readFileAlloc(self.io, route.file, self.gpa, .limited(4 * 1024 * 1024));
-            errdefer self.gpa.free(source);
-            node.component = try parser.parse(self.gpa, source);
-            node.source = source;
-            node.parsed = true;
+            group.async(self.io, parseRouteNode, .{ node, self.io, self.routes.items[node.index].file });
         }
+        group.await(self.io) catch {};
+        for (self.nodes) |*node| {
+            if (node.err) |err| return err;
+        }
+        // Layouts (deduped, far fewer) stay serial on the build allocator.
         for (self.routes.items) |route| {
             for (route.layouts) |layout| {
                 if (self.findLayout(layout.file) != null) continue;

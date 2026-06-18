@@ -867,10 +867,19 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
             error.FileNotFound => {
                 if (std.mem.startsWith(u8, path, "/assets/")) {
                     try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = 404 });
-                    try writeRenderedError(io, allocator, stream, root, 404, accept, .{
+                    // Dev nuance (§4): distinguish "never existed" from "exists in
+                    // static/ but was pruned as unreferenced". Production stays
+                    // generic — the lookup only runs under debug_errors.
+                    var unreferenced = false;
+                    if (debug_errors) unreferenced = unreferencedAssetMatch(io, allocator, root, path) catch false;
+                    const body: ErrorBody = if (unreferenced) .{
+                        .message = "Asset exists in static/ but is never referenced via asset(), so it was not installed.",
+                        .code = "asset_unreferenced",
+                    } else .{
                         .message = "Asset not found",
                         .code = "not_found",
-                    }, response_headers_list.items, null, debug_errors);
+                    };
+                    try writeRenderedError(io, allocator, stream, root, 404, accept, body, response_headers_list.items, null, debug_errors);
                     return;
                 }
                 break :asset try readAsset(io, allocator, root, "/index.html");
@@ -1365,6 +1374,28 @@ fn isNavigableHtml(method: []const u8, accept: []const u8, path: []const u8) boo
 }
 
 const PrerenderEntry = struct { path: []const u8, file: []const u8 };
+
+const UnreferencedAsset = struct { logical: []const u8, url: []const u8 };
+
+/// True if `path` (an `/assets/...` request) matches an asset that exists in
+/// `static/` but was pruned as unreferenced (§4), per `dist/assets.unreferenced.json`.
+/// Absent manifest or parse failure is treated as "no match" — the caller falls
+/// back to a generic 404. Only consulted in dev (`debug_errors`).
+fn unreferencedAssetMatch(io: std.Io, allocator: std.mem.Allocator, root: []const u8, path: []const u8) !bool {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/assets.unreferenced.json", .{root});
+    defer allocator.free(manifest_path);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(data);
+    const parsed = std.json.parseFromSlice([]UnreferencedAsset, allocator, data, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    for (parsed.value) |entry| {
+        if (std.mem.eql(u8, entry.url, path)) return true;
+    }
+    return false;
+}
 
 /// Resolves a navigable path to its prerendered document via dist/prerender.json.
 /// Returns a request-style path ("/pages/pageN.html") to read, or null to fall
@@ -2054,4 +2085,25 @@ test "signed cookies and csrf validation reject tampering" {
         .{ .name = "x-csrf-token", .value = "bad" },
     };
     try std.testing.expect(!validCsrfForRequest(allocator, &bad_headers, "", secret));
+}
+
+test "unreferencedAssetMatch detects pruned assets from the dev manifest" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "assets.unreferenced.json",
+        .data =
+        \\[{"logical":"orphan.txt","url":"/assets/orphan.abc123.txt"}]
+        ,
+    });
+    // root is a relative path; the helper reads root-relative, no chdir needed.
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+
+    try std.testing.expect(try unreferencedAssetMatch(io, a, root, "/assets/orphan.abc123.txt"));
+    try std.testing.expect(!try unreferencedAssetMatch(io, a, root, "/assets/something-else.txt"));
+    // Absent manifest is a clean "no match", not an error.
+    try std.testing.expect(!try unreferencedAssetMatch(io, a, "/no/such/root", "/assets/x"));
 }

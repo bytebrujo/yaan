@@ -1,0 +1,18 @@
+<script>
+// A declarative fetcher form: submits to the typed +actions.zig without a
+// navigation or history entry, and exposes reactive submit state for the UI.
+const save = $fetcher();
+const status = $memo(() => {
+  if (save.busy()) return "Saving…";
+  const result = save.data();
+  if (!result) return "No tasks added yet";
+  return result.ok ? `Added "${result.title}"` : "A title is required";
+});
+</script>
+
+<h1>Tasks</h1>
+<form method="POST" on:submit={save.enhance}>
+  <label>Title <input name="title" /></label>
+  <button disabled={save.busy()}>Add</button>
+</form>
+<p>{status.read()}</p>

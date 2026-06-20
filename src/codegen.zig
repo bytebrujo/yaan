@@ -41,7 +41,7 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
         allocator.free(script.body);
     }
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(allocator, "import { $signal, $state, $memo, $derived, $resource, $effect, text, mount, clear, reconcileKeyed, reconcileIndexed, hydrateCursor, hydrateElement, hydrateText, hydrateComment, hydrateInterp } from '../runtime.js';\n");
+    try out.appendSlice(allocator, "import { $signal, $state, $memo, $derived, $resource, $effect, $fetcher, $submit, text, mount, clear, bindAttr, reconcileKeyed, reconcileIndexed, hydrateCursor, hydrateElement, hydrateText, hydrateComment, hydrateInterp } from '../runtime.js';\n");
     try out.appendSlice(allocator, "import { asset } from '../assets.js';\n");
     if (script.imports.len > 0) {
         try out.appendSlice(allocator, script.imports);
@@ -63,6 +63,7 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
     try out.appendSlice(allocator,
         \\  return {
         \\    snapshot: typeof snapshot !== 'undefined' ? snapshot : null,
+        \\    clientAction: typeof clientAction !== 'undefined' ? clientAction : null,
         \\    slot: __yaan_slot,
         \\    destroy() { for (const dispose of disposers.splice(0)) dispose(); clear(target); }
         \\  };
@@ -86,6 +87,7 @@ pub fn generateComponent(allocator: std.mem.Allocator, path: []const u8, compone
     try out.appendSlice(allocator,
         \\  return {
         \\    snapshot: typeof snapshot !== 'undefined' ? snapshot : null,
+        \\    clientAction: typeof clientAction !== 'undefined' ? clientAction : null,
         \\    slot: __yaan_slot,
         \\    destroy() { for (const dispose of disposers.splice(0)) dispose(); clear(target); }
         \\  };
@@ -257,6 +259,16 @@ pub fn runtimeSource() []const u8 {
     \\  target.appendChild(node);
     \\  return { update(next) { node.data = next ?? ""; }, destroy() { node.remove(); } };
     \\}
+    \\// Reactive attribute binding: re-runs whenever the expression's signals change.
+    \\// Boolean-attribute semantics — false/null/undefined remove it, true sets it
+    \\// empty, any other value is stringified.
+    \\export function bindAttr(node, name, get) {
+    \\  return $effect(() => {
+    \\    const value = get();
+    \\    if (value === false || value == null) node.removeAttribute(name);
+    \\    else node.setAttribute(name, value === true ? '' : value);
+    \\  });
+    \\}
     \\export function mount(target, node) { target.appendChild(node); return node; }
     \\export function clear(target) { while (target.firstChild) target.firstChild.remove(); }
     \\export function hydrateCursor(parent) { return { parent, next: parent.firstChild }; }
@@ -316,6 +328,60 @@ pub fn runtimeSource() []const u8 {
     \\    anchor.parentNode.insertBefore(state.blocks[i].fragment, anchor);
     \\  }
     \\}
+    \\// The router (app.js) registers its submit/revalidate seam here so component
+    \\// primitives ($submit, $fetcher) can drive navigation and loader revalidation
+    \\// without importing app.js (which would create a cycle). ES modules are
+    \\// singletons per URL, so the instance app.js connects is the one components see.
+    \\let __router = null;
+    \\export function __connectRouter(api) { __router = api; }
+    \\function requireRouter() {
+    \\  if (!__router) throw new Error('Yaan router is not ready yet');
+    \\  return __router;
+    \\}
+    \\// Imperative submit (React Router useSubmit): POST to an action route and
+    \\// navigate there, pushing a history entry. data is a FormData or plain object.
+    \\export function $submit(data, options = {}) {
+    \\  return requireRouter().submit(data, options);
+    \\}
+    \\// Non-navigational mutation with reactive state (React Router useFetcher):
+    \\// runs the action without touching history, then revalidates page loaders.
+    \\// state() is 'idle' | 'submitting' | 'loading'; data() is the last result.
+    \\export function $fetcher() {
+    \\  const state = $signal({ state: 'idle', data: null });
+    \\  const f = {
+    \\    read: state.read,
+    \\    state() { return state.read().state; },
+    \\    data() { return state.read().data; },
+    \\    idle() { return state.read().state === 'idle'; },
+    \\    submitting() { return state.read().state === 'submitting'; },
+    \\    loading() { return state.read().state === 'loading'; },
+    \\    busy() { return state.read().state !== 'idle'; },
+    \\    async submit(data, options = {}) {
+    \\      state.set({ state: 'submitting', data: state.peek().data });
+    \\      try {
+    \\        const result = await requireRouter().fetcherSubmit(data, options, () =>
+    \\          state.set({ state: 'loading', data: state.peek().data }));
+    \\        state.set({ state: 'idle', data: result });
+    \\        return result;
+    \\      } catch (error) {
+    \\        state.set({ state: 'idle', data: state.peek().data });
+    \\        throw error;
+    \\      }
+    \\    },
+    \\  };
+    \\  // Declarative binding for <form on:submit={fetcher.enhance}>: submits the form
+    \\  // through this fetcher (no navigation) and stops the global navigating handler.
+    \\  f.enhance = (event) => {
+    \\    event.preventDefault();
+    \\    event.stopPropagation();
+    \\    const form = event.currentTarget;
+    \\    return f.submit(new FormData(form), {
+    \\      action: form.getAttribute('action') || undefined,
+    \\      method: form.getAttribute('method') || 'post',
+    \\    });
+    \\  };
+    \\  return f;
+    \\}
     ;
 }
 
@@ -323,6 +389,7 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(allocator,
         \\import { routes } from './routes.js';
+        \\import { __connectRouter } from './runtime.js';
         \\
         \\const outlet = document.getElementById('app');
         \\const live = document.getElementById('yaan-live');
@@ -641,27 +708,89 @@ pub fn appSource(allocator: std.mem.Allocator, routes_json: []const u8) ![]u8 {
         \\  }
         \\  if (restore) restoreSnapshot(activeHistoryKey);
         \\}
-        \\async function submitForm(form) {
-        \\  const url = new URL(form.getAttribute('action') || location.pathname, location.href);
+        \\// Encode a plain object or FormData for an action POST. Multipart only when
+        \\// a File is present; otherwise urlencoded (matches native form posting).
+        \\function encodeBody(data, method) {
+        \\  const init = { method: (method || 'post').toUpperCase() };
+        \\  const formData = data instanceof FormData ? data
+        \\    : (() => { const fd = new FormData(); for (const [k, v] of Object.entries(data || {})) fd.append(k, v); return fd; })();
+        \\  const hasFile = Array.from(formData.values()).some(v => v instanceof File && v.name !== '');
+        \\  if (hasFile) init.body = formData;
+        \\  else {
+        \\    init.headers = { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' };
+        \\    init.body = new URLSearchParams(formData);
+        \\  }
+        \\  return init;
+        \\}
+        \\// Encode a <form> element for an action POST, honouring its enctype.
+        \\function encodeFormElement(form) {
         \\  const formData = new FormData(form);
         \\  const hasFile = Array.from(form.elements).some(el => el && el.type === 'file');
         \\  const isMultipart = hasFile || (form.enctype || '').toLowerCase() === 'multipart/form-data';
         \\  const init = { method: 'POST' };
-        \\  if (isMultipart) {
-        \\    init.body = formData;
-        \\  } else {
+        \\  if (isMultipart) init.body = formData;
+        \\  else {
         \\    init.headers = { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' };
         \\    init.body = new URLSearchParams(formData);
         \\  }
+        \\  return init;
+        \\}
+        \\function runActionRequest(target, init) {
+        \\  return fetch(target.pathname + target.search, init).then(r => r.json());
+        \\}
+        \\// Run an action, store its result as the page's form prop, then either
+        \\// navigate to the action route (React Router <Form> semantics: a new history
+        \\// entry, the target's loader runs) when it differs from the current path, or
+        \\// re-render in place when posting to the current route.
+        \\async function runActionNavigating(target, init) {
+        \\  formResult = await runActionRequest(target, init);
+        \\  if (target.pathname !== location.pathname) {
+        \\    const key = newHistoryKey();
+        \\    history.pushState({ ynKey: key }, '', target.pathname + target.search);
+        \\    activeHistoryKey = key;
+        \\    await render({ animate: true, scroll: 'top' });
+        \\  } else {
+        \\    await render({ restoreSnapshot: false, animate: true, scroll: 'top' });
+        \\  }
+        \\}
+        \\async function submitForm(form) {
+        \\  const url = new URL(form.getAttribute('action') || location.pathname, location.href);
         \\  const submitter = document.activeElement && form.contains(document.activeElement) ? document.activeElement : null;
         \\  if (submitter) submitter.disabled = true;
         \\  try {
-        \\    formResult = await fetch(url.pathname + url.search, init).then(r => r.json());
+        \\    // A clientAction on the current page takes priority over the server action
+        \\    // and can fall through to it via request.serverAction().
+        \\    const page = activePage();
+        \\    if (page && typeof page.clientAction === 'function') {
+        \\      const formData = new FormData(form);
+        \\      formResult = await page.clientAction({
+        \\        formData,
+        \\        request: { method: 'POST', url: url.href, formData: async () => formData },
+        \\        serverAction: () => runActionRequest(url, encodeFormElement(form)),
+        \\      });
+        \\      await render({ restoreSnapshot: false, animate: true, scroll: 'top' });
+        \\    } else {
+        \\      await runActionNavigating(url, encodeFormElement(form));
+        \\    }
         \\  } finally {
         \\    if (submitter) submitter.disabled = false;
         \\  }
-        \\  await render({ restoreSnapshot: false, animate: true, scroll: 'top' });
         \\}
+        \\// Component-facing seam used by $submit (imperative, navigates) and $fetcher
+        \\// (non-navigational, revalidates page loaders without a history entry).
+        \\__connectRouter({
+        \\  submit(data, options = {}) {
+        \\    const target = new URL(options.action || location.pathname, location.href);
+        \\    return runActionNavigating(target, encodeBody(data, options.method));
+        \\  },
+        \\  async fetcherSubmit(data, options, onLoading) {
+        \\    const target = new URL(options.action || location.pathname, location.href);
+        \\    const result = await runActionRequest(target, encodeBody(data, options.method));
+        \\    if (onLoading) onLoading();
+        \\    await render({ restoreSnapshot: false, animate: false });
+        \\    return result;
+        \\  },
+        \\});
         \\function navigateTo(href) {
         \\  captureSnapshot();
         \\  formResult = null;
@@ -980,7 +1109,7 @@ fn emitAttrs(allocator: std.mem.Allocator, out: *std.ArrayList(u8), elem: parser
             const attr_name = try jsString(allocator, attr.name);
             defer allocator.free(attr_name);
             if (attr.expression) {
-                try out.print(allocator, "{s}{s}.setAttribute({s}, ({s}));\n", .{ indent, name, attr_name, value });
+                try out.print(allocator, "{s}disposers.push(bindAttr({s}, {s}, () => ({s})));\n", .{ indent, name, attr_name, value });
             } else {
                 const attr_value = try jsString(allocator, value);
                 defer allocator.free(attr_value);
@@ -1216,6 +1345,14 @@ test "component emits create, hydrate and a static prerender skeleton" {
     // Both entrypoints are generated.
     try std.testing.expect(std.mem.indexOf(u8, generated.js, "export function create(target") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated.js, "export function hydrate(target") != null);
+    // Component-facing mutation primitives are imported and an optional clientAction
+    // is surfaced on the instance (mirrors the snapshot opt-in).
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "$fetcher, $submit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "clientAction: typeof clientAction !== 'undefined'") != null);
+    // Expression attributes bind reactively (the {asset(...)} src), so they track
+    // signal changes rather than being set once at mount.
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, "bindAttr(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated.js, ".setAttribute(\"src\"") == null);
     // Hydrate adopts via cursor helpers rather than createElement.
     try std.testing.expect(std.mem.indexOf(u8, generated.js, "hydrateElement(") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated.js, "hydrateInterp(") != null);
@@ -1240,6 +1377,22 @@ test "runtime exposes explicit state primitives" {
     try std.testing.expect(std.mem.indexOf(u8, runtime, "export function $resource") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime, "export const $state = $signal") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime, "export const $derived = $memo") != null);
+}
+
+test "runtime exposes router-connected mutation primitives" {
+    const runtime = runtimeSource();
+    // app.js registers its submit/revalidate seam without an import cycle.
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "export function __connectRouter") != null);
+    // Imperative submit (useSubmit) and reactive fetcher (useFetcher) equivalents.
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "export function $submit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "export function $fetcher") != null);
+    // The fetcher tracks idle/submitting/loading state on a signal.
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "state: 'submitting'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "state: 'loading'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "requireRouter().fetcherSubmit") != null);
+    // Declarative <form on:submit={fetcher.enhance}> binding stops the global handler.
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "f.enhance = (event) =>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "event.stopPropagation()") != null);
 }
 
 test "html shell carries lang, modulepreload, live region and escapes title" {
@@ -1307,6 +1460,20 @@ test "app router adopts modern navigation, a11y and performance patterns" {
     // and the page (last level) always rebuilds.
     try std.testing.expect(std.mem.indexOf(u8, app, "currentChainData[common] === stringifyData(layerData[common])") != null);
     try std.testing.expect(std.mem.indexOf(u8, app, "const keepMax = chainUrls.length - 1") != null);
+}
+
+test "app router wires actions: cross-route navigation, clientAction, fetcher seam" {
+    const app = try appSource(std.testing.allocator, "[]");
+    defer std.testing.allocator.free(app);
+    // Cross-route <Form action> navigates to the action route (RR <Form> semantics).
+    try std.testing.expect(std.mem.indexOf(u8, app, "function runActionNavigating(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "if (target.pathname !== location.pathname)") != null);
+    // A clientAction on the current page takes priority and can fall through.
+    try std.testing.expect(std.mem.indexOf(u8, app, "typeof page.clientAction === 'function'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "serverAction:") != null);
+    // The router seam $submit / $fetcher call into is registered.
+    try std.testing.expect(std.mem.indexOf(u8, app, "__connectRouter({") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app, "fetcherSubmit(data, options, onLoading)") != null);
 }
 
 test "layout slot codegen exposes an outlet the page does not" {

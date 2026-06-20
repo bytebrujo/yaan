@@ -1,5 +1,14 @@
 <script>
 const message = $memo(() => props.form?.message ?? "Sign in");
+// A clientAction runs in the browser and takes priority over the server +action.
+// Here it short-circuits an obviously-invalid password without a round-trip, and
+// otherwise falls through to the typed Zig action via serverAction().
+const clientAction = async ({ formData, serverAction }) => {
+  if ((formData.get("password") || "").length < 6) {
+    return { ok: false, message: "Password is too short" };
+  }
+  return serverAction();
+};
 const snapshot = {
   capture() {
     const form = document.querySelector("form");

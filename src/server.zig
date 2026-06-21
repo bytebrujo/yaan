@@ -1,8 +1,97 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const observability = @import("observability.zig");
 const pipeline = @import("pipeline.zig");
 
 var upload_counter: usize = 0;
+
+/// A per-instance upload directory, created 0700 with an unpredictable name at
+/// startup so request-scoped uploads are not world-readable in a shared /tmp and
+/// cannot be redirected via a pre-planted symlink. Falls back to the configured
+/// `upload_dir` when unset (e.g. tests, which never call `serve`).
+var upload_dir_storage: [512]u8 = undefined;
+var upload_dir_actual: ?[]const u8 = null;
+
+fn resolvedUploadDir(options: StaticServerOptions) []const u8 {
+    return upload_dir_actual orelse options.upload_dir;
+}
+
+/// Creates `<base>-<random>` with mode 0700 via mkdir (which fails if the path
+/// already exists, defeating symlink pre-creation). Best-effort: on failure the
+/// configured `upload_dir` is used as-is.
+fn createInstanceUploadDir(io: std.Io, base: []const u8) void {
+    var rnd: [12]u8 = undefined;
+    io.randomSecure(&rnd) catch io.random(&rnd);
+    var hex: [24]u8 = undefined;
+    writeHexBytes(hex[0..], &rnd);
+    const dir = std.fmt.bufPrintZ(&upload_dir_storage, "{s}-{s}", .{ base, hex }) catch return;
+    if (std.posix.errno(std.posix.system.mkdir(dir.ptr, 0o700)) == .SUCCESS) {
+        upload_dir_actual = dir[0..dir.len];
+    }
+}
+
+/// Looks up an embedded asset by normalized request path ("/index.html",
+/// "/assets/style.<hash>.css"), returning its bytes or null. Set by the
+/// in-process deploy artifact so the binary serves dist/ from inside itself.
+pub const AssetLookup = *const fn (rel_path: []const u8) ?[]const u8;
+
+/// Process-wide embedded-asset seam. The server is a singleton, so this is set
+/// once in `serve()` before any request (and before any worker thread spawns),
+/// then read-only. When set, static serving never touches the filesystem — the
+/// artifact carries its own dist/. Null preserves the read-from-disk behavior
+/// (dev server, tests).
+var embedded_assets: ?AssetLookup = null;
+
+/// Set by SIGTERM/SIGINT so the accept loop exits and drains. Atomic because it
+/// is written from a signal handler and read from the accept loop.
+var shutdown_requested: std.atomic.Value(bool) = .init(false);
+
+/// The listener's actual bound address (captured via getsockname after listen),
+/// so the signal handler can self-connect to it to wake a blocked `accept`. We
+/// do NOT close the listener fd from the handler: the threaded Io treats
+/// accept-on-closed-fd as a fatal programmer bug (panics on EBADF). Capturing
+/// the real bound address (not the requested host/port) makes the wake work for
+/// IPv6 binds, specific-interface binds, and ephemeral (`--port 0`) ports — for
+/// wildcard binds (0.0.0.0 / ::) connecting to the bound address reaches
+/// loopback. Written once before any worker thread, then read-only.
+var wake_addr: std.posix.sockaddr.storage = undefined;
+var wake_addr_len: std.posix.socklen_t = 0;
+var wake_armed: std.atomic.Value(bool) = .init(false);
+
+/// Connects to the listener's bound address to wake a blocked `accept`. Uses
+/// only raw syscalls (socket/connect/close), all async-signal-safe. Best-effort:
+/// errors are ignored (the process is exiting anyway).
+fn wakeAccept() void {
+    if (!wake_armed.load(.seq_cst)) return;
+    const sa: *const std.posix.sockaddr = @ptrCast(&wake_addr);
+    const family: u32 = sa.family;
+    const rc = std.posix.system.socket(family, std.posix.SOCK.STREAM, 0);
+    if (std.posix.errno(rc) != .SUCCESS) return;
+    const fd: std.posix.fd_t = @intCast(rc);
+    defer _ = std.posix.system.close(fd);
+    _ = std.posix.system.connect(fd, @ptrCast(&wake_addr), wake_addr_len);
+}
+
+/// Async-signal-safe shutdown handler: flag the loop, then self-connect so a
+/// blocked `accept` returns. Only atomic stores and syscalls — safe in signal
+/// context. errno is saved/restored so interrupting a libc call mid-flight does
+/// not corrupt the interrupted thread's errno.
+fn onShutdownSignal(_: i32) callconv(.c) void {
+    const saved_errno = if (builtin.link_libc) std.c._errno().* else {};
+    shutdown_requested.store(true, .seq_cst);
+    wakeAccept();
+    if (builtin.link_libc) std.c._errno().* = saved_errno;
+}
+
+fn installShutdownHandlers() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = @ptrCast(&onShutdownSignal) },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
 
 pub const StaticServerOptions = struct {
     host: []const u8 = "127.0.0.1",
@@ -24,6 +113,16 @@ pub const StaticServerOptions = struct {
     load_runner: []const u8 = ".yaan/load_runner",
     action_runner: []const u8 = ".yaan/action_runner",
     remote_runner: []const u8 = ".yaan/remote_runner",
+    /// When set, static assets + prerendered docs are served from this embedded
+    /// lookup instead of the filesystem (the single-binary deploy artifact).
+    assets: ?AssetLookup = null,
+    /// Built-in liveness endpoint. A GET/HEAD here returns 200 `{"status":"ok"}`
+    /// before TLS redirect, hooks, loaders, or the filesystem — the minimum a
+    /// supervisor (systemd/k8s/Fly) needs for health probes. Set to "" to disable.
+    health_path: []const u8 = "/healthz",
+    /// Directory for request-scoped temp upload files. Absolute by default so the
+    /// artifact works from any working directory; deleted after the request.
+    upload_dir: []const u8 = "/tmp/yaan-uploads",
     observability: observability.Config = .{},
     debug_errors: bool = true,
     max_body_length: usize = 8 * 1024 * 1024,
@@ -106,25 +205,81 @@ fn encodeBody(allocator: std.mem.Allocator, accept_encoding: []const u8, mime: [
 }
 
 pub fn serve(io: std.Io, allocator: std.mem.Allocator, options: StaticServerOptions) !void {
+    // Publish the embedded-asset seam once, before the accept loop. Read-only
+    // thereafter, so it is safe for concurrent request handling.
+    embedded_assets = options.assets;
+    // Private per-instance upload dir (0700, unpredictable name) before serving.
+    createInstanceUploadDir(io, options.upload_dir);
     var address = try std.Io.net.IpAddress.parse(options.host, options.port);
     if (options.observability.enabled) {
         std.debug.print("yaan tracing enabled: service={s} endpoint={s}\n", .{ options.observability.service_name, options.observability.endpoint });
     }
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
+    // Capture the ACTUAL bound address (handles ephemeral ports and any family),
+    // then install SIGTERM/SIGINT handlers that self-connect to it to unblock
+    // accept and trigger a graceful drain.
+    {
+        var slen: std.posix.socklen_t = @sizeOf(@TypeOf(wake_addr));
+        if (std.posix.errno(std.posix.system.getsockname(listener.socket.handle, @ptrCast(&wake_addr), &slen)) == .SUCCESS) {
+            wake_addr_len = slen;
+            wake_armed.store(true, .seq_cst);
+        }
+    }
+    installShutdownHandlers();
     std.debug.print("{s} listening on http://{s}:{d}\n", .{ options.label, options.host, options.port });
 
+    // Handle each connection as a concurrent task so one slow request (a loader
+    // waiting on a DB, a subprocess runner) never blocks the whole server. The
+    // group is long-lived; `concurrent` tasks release their resources as they
+    // return, so repeatedly adding tasks is not a leak. If the Io implementation
+    // does not support concurrency, fall back to handling the connection inline.
+    var group: std.Io.Group = .init;
     while (true) {
-        var stream = try listener.accept(io);
-        defer stream.close(io);
-        handleConnection(io, allocator, stream, options.root, options.hook_runner, options.load_runner, options.action_runner, options.remote_runner, options.observability, options.debug_errors, options.max_body_length, options) catch |err| {
-            std.debug.print("request failed: {t}\n", .{err});
-            writeRenderedError(io, allocator, stream, options.root, 500, "", .{
-                .message = "Internal Error",
-                .code = "internal_error",
-            }, &.{}, null, options.debug_errors) catch {};
+        // Check the flag before AND after accept so neither a wake self-connection
+        // nor an aborted accept can swallow the shutdown signal.
+        if (shutdown_requested.load(.seq_cst)) break;
+        const stream = listener.accept(io) catch |err| switch (err) {
+            error.ConnectionAborted => continue,
+            else => {
+                if (shutdown_requested.load(.seq_cst)) break;
+                return err;
+            },
+        };
+        // The shutdown signal wakes us with a throwaway self-connection; discard
+        // it and stop accepting.
+        if (shutdown_requested.load(.seq_cst)) {
+            stream.close(io);
+            break;
+        }
+        group.concurrent(io, serveConnection, .{ io, allocator, stream, options }) catch {
+            serveConnection(io, allocator, stream, options);
         };
     }
+
+    // Graceful shutdown: stopped accepting; let in-flight requests finish.
+    std.debug.print("yaan: shutting down, draining in-flight requests...\n", .{});
+    group.await(io) catch {};
+    std.debug.print("yaan: drained, exiting.\n", .{});
+}
+
+/// Handles a single accepted connection to completion on its own per-request
+/// arena (thread-safe base, reclaimed when the request finishes), then closes
+/// the socket. Errors are rendered as a generic 500 — never propagated out of a
+/// concurrent task. The per-connection arena means concurrent requests share no
+/// mutable allocator state.
+fn serveConnection(io: std.Io, base: std.mem.Allocator, stream: std.Io.net.Stream, options: StaticServerOptions) void {
+    defer stream.close(io);
+    var arena = std.heap.ArenaAllocator.init(base);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    handleConnection(io, allocator, stream, options.root, options.hook_runner, options.load_runner, options.action_runner, options.remote_runner, options.observability, options.debug_errors, options.max_body_length, options) catch |err| {
+        std.debug.print("request failed: {t}\n", .{err});
+        writeRenderedError(io, allocator, stream, options.root, 500, "", .{
+            .message = "Internal Error",
+            .code = "internal_error",
+        }, &.{}, null, options.debug_errors) catch {};
+    };
 }
 
 pub fn describe(options: StaticServerOptions, allocator: std.mem.Allocator) ![]u8 {
@@ -654,6 +809,19 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
             forwarded_port = nearestForwardedValue(stored);
         }
     }
+    // Built-in liveness endpoint: answered before TLS redirect/security so a
+    // probe works regardless of --force-https/--hsts, and never touches hooks,
+    // loaders, or the filesystem. Disabled when health_path is "".
+    if (options.health_path.len > 0 and std.mem.eql(u8, sanitizePath(target), options.health_path)) {
+        try tracer.setAttribute(trace.root, "http.response.status_code", .{ .int = 200 });
+        const health_body = "{\"status\":\"ok\"}";
+        if (std.mem.eql(u8, method, "HEAD")) {
+            try writeHeadWithHeaders(io, stream, "200 OK", "application/json; charset=utf-8", health_body.len, &.{});
+        } else {
+            try writeResponseWithHeaders(io, stream, "200 OK", "application/json; charset=utf-8", health_body, &.{}, null);
+        }
+        return;
+    }
     const security = try requestSecurity(allocator, stream.socket.address, options.trusted_proxies, host, forwarded_proto, forwarded_host, forwarded_port);
     defer if (security.host.ptr != host.ptr) allocator.free(security.host);
     if (options.force_https and !security.secure) {
@@ -913,6 +1081,17 @@ fn readAsset(io: std.Io, allocator: std.mem.Allocator, root: []const u8, request
     const rel = if (std.mem.eql(u8, request_path, "/")) "/index.html" else request_path;
     const trimmed = trimLeadingSlash(rel);
     if (std.mem.indexOf(u8, trimmed, "..") != null) return error.FileNotFound;
+    // Never serve the generated embed module that lives inside dist/ (it backs
+    // the single-binary artifact; it is not a public asset).
+    // Case-insensitive: on a case-insensitive filesystem (macOS APFS) a request
+    // for /.EMBED.ZIG would otherwise resolve to the generated embed source.
+    if (std.ascii.endsWithIgnoreCase(trimmed, ".embed.zig")) return error.FileNotFound;
+    // When assets are embedded, the binary is authoritative: a miss means the
+    // file does not exist (no filesystem fallback, so no CWD dependence).
+    if (embedded_assets) |lookup| {
+        if (lookup(rel)) |bytes| return allocator.dupe(u8, bytes);
+        return error.FileNotFound;
+    }
     const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, trimmed });
     defer allocator.free(full);
     return std.Io.Dir.cwd().readFileAlloc(io, full, allocator, .limited(8 * 1024 * 1024));
@@ -1073,10 +1252,13 @@ fn parseMultipart(io: std.Io, allocator: std.mem.Allocator, body: []const u8, bo
             if (upload_index >= options.max_upload_count) return error.PayloadTooLarge;
             if (content.len > options.max_upload_file_length) return error.PayloadTooLarge;
             const content_type = multipartHeader(header_block, "content-type") orelse "application/octet-stream";
-            const path = try uniqueUploadPath(io, allocator, upload_index);
+            const upload_dir = resolvedUploadDir(options);
+            const path = try uniqueUploadPath(io, allocator, upload_dir, upload_index);
             errdefer allocator.free(path);
             upload_index += 1;
-            try std.Io.Dir.cwd().createDirPath(io, ".yaan/tmp");
+            // createInstanceUploadDir made this 0700 at startup; createDirPath is
+            // for the fallback path (e.g. tests that call parseMultipart directly).
+            try std.Io.Dir.cwd().createDirPath(io, upload_dir);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
             try uploads.append(allocator, .{
                 .name = try allocator.dupe(u8, name),
@@ -1136,13 +1318,14 @@ fn dispositionParam(disposition: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn uniqueUploadPath(io: std.Io, allocator: std.mem.Allocator, index: usize) ![]u8 {
+fn uniqueUploadPath(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, index: usize) ![]u8 {
     const counter = @atomicRmw(usize, &upload_counter, .Add, 1, .monotonic);
     var random_bytes: [16]u8 = undefined;
     io.randomSecure(&random_bytes) catch io.random(&random_bytes);
     var random_hex: [32]u8 = undefined;
     writeHexBytes(random_hex[0..], &random_bytes);
-    return std.fmt.allocPrint(allocator, ".yaan/tmp/upload-{d}-{d}-{s}", .{ counter, index, random_hex });
+    const clean_dir = if (dir.len > 1 and dir[dir.len - 1] == '/') dir[0 .. dir.len - 1] else dir;
+    return std.fmt.allocPrint(allocator, "{s}/upload-{d}-{d}-{s}", .{ clean_dir, counter, index, random_hex });
 }
 
 fn appendFormEscaped(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
@@ -1401,11 +1584,17 @@ fn unreferencedAssetMatch(io: std.Io, allocator: std.mem.Allocator, root: []cons
 /// Returns a request-style path ("/pages/pageN.html") to read, or null to fall
 /// back to the default shell. Apps built without prerendering simply return null.
 fn matchPrerenderFile(io: std.Io, allocator: std.mem.Allocator, root: []const u8, path: []const u8) !?[]u8 {
-    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/prerender.json", .{root});
-    defer allocator.free(manifest_path);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
+    // Prefer the embedded manifest so the single-binary artifact resolves
+    // prerendered docs without a dist/ on disk.
+    const data = if (embedded_assets) |lookup|
+        try allocator.dupe(u8, lookup("/prerender.json") orelse return null)
+    else blk: {
+        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/prerender.json", .{root});
+        defer allocator.free(manifest_path);
+        break :blk std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
     };
     defer allocator.free(data);
     const parsed = std.json.parseFromSlice([]PrerenderEntry, allocator, data, .{}) catch return null;

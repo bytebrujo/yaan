@@ -27,7 +27,12 @@ pub fn build(b: *std.Build) void {
     // in-process server builder all come from it.
     const yaan_dep = b.dependency("yaan", .{ .target = target, .optimize = optimize });
     const yaan_mod = yaan_dep.module("yaan");
-    const yaan_exe = yaan_dep.artifact("yaan");
+    // The `yaan` CLI runs DURING the build (codegen, dist), so it must target the
+    // host even when cross-compiling the app (e.g. -Dtarget=x86_64-linux-musl for
+    // a container image). Building it for the app target would produce a binary
+    // the build host cannot execute.
+    const yaan_host_dep = b.dependency("yaan", .{ .target = b.graph.host, .optimize = .ReleaseFast });
+    const yaan_exe = yaan_host_dep.artifact("yaan");
 
     const check_step = b.step("check", "Run framework-aware Yaan checks");
     const check_cmd = b.addRunArtifact(yaan_exe);
@@ -75,10 +80,15 @@ pub fn build(b: *std.Build) void {
     if (read_timeout_ms) |value| dev_cmd.addArgs(&.{ "--read-timeout-ms", value });
     dev_step.dependOn(&dev_cmd.step);
 
-    // Serve a prior `yaan build` with production-safe defaults (subprocess
+    // Serve a production build with production-safe defaults (subprocess
     // runners). For the linked-in deploy artifact, use `dev-inproc` below.
-    const start_step = b.step("start", "Serve a production build (run `build-app` first)");
+    // `start` builds the app WITH runners first so the server never invokes the
+    // Zig toolchain at boot.
+    const start_step = b.step("start", "Serve a production build");
+    const start_build_cmd = b.addRunArtifact(yaan_exe);
+    start_build_cmd.addArgs(&.{ "build", "--out", "dist", "--runners" });
     const start_cmd = b.addRunArtifact(yaan_exe);
+    start_cmd.step.dependOn(&start_build_cmd.step);
     start_cmd.addArgs(&.{ "start", "--host", dev_host, "--port", dev_port });
     if (otel_endpoint) |endpoint| {
         start_cmd.addArgs(&.{ "--otel-endpoint", endpoint, "--otel-service", otel_service });
@@ -99,6 +109,7 @@ pub fn build(b: *std.Build) void {
     start_step.dependOn(&start_cmd.step);
 
     // In-process server: handlers linked into the binary, no runner subprocesses.
+    // (Wired below via `addInProcessServer`; the dev-inproc step runs it.)
     // The whole module graph is discovered and wired by the framework.
     const app_server = yaan.addInProcessServer(b, .{
         .target = target,
@@ -106,6 +117,10 @@ pub fn build(b: *std.Build) void {
         .yaan_dep = yaan_dep,
         .app_build_step = &app_build_cmd.step,
     });
+    // Install the in-process server as the deployable single binary. With
+    // `-Doptimize=ReleaseFast` this is the artifact you ship: `zig build` puts it
+    // at zig-out/bin/yaan-app, dist/ embedded, no Zig toolchain needed to run it.
+    b.installArtifact(app_server);
     const dev_inproc_step = b.step("dev-inproc", "Run the in-process server (handlers linked in, no runner subprocesses)");
     const dev_inproc_cmd = b.addRunArtifact(app_server);
     dev_inproc_cmd.addArgs(&.{ "--host", dev_host, "--port", dev_port });

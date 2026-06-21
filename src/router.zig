@@ -839,6 +839,7 @@ pub fn generateLoadRunner(allocator: std.mem.Allocator, routes: []const RoutePat
         \\
         \\pub fn main(init: std.process.Init) !void {
         \\    const allocator = init.arena.allocator();
+        \\    try @import("env").init(init.environ_map);
         \\    const args = try init.minimal.args.toSlice(allocator);
         \\    if (args.len < 3) return error.InvalidArguments;
         \\    const headers_json = if (args.len >= 4) args[3] else "[]";
@@ -1013,6 +1014,7 @@ pub fn generateActionRunner(allocator: std.mem.Allocator, routes: []const RouteP
         \\
         \\pub fn main(init: std.process.Init) !void {
         \\    const allocator = init.arena.allocator();
+        \\    try @import("env").init(init.environ_map);
         \\    const args = try init.minimal.args.toSlice(allocator);
         \\    if (args.len < 4) return error.InvalidArguments;
         \\    const uploads_json = if (args.len >= 5) args[4] else "[]";

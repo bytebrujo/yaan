@@ -246,6 +246,10 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("yaan", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        // project.zig (std.c.getenv) and observability.zig (std.c.gettimeofday)
+        // use libc. macOS links it implicitly; Linux does not — so make it
+        // explicit, or `zig build` fails on Linux (and in CI).
+        .link_libc = true,
     });
 
     // Bake the framework's source root into the CLI so `yaan init` can scaffold
@@ -290,6 +294,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "yaan", .module = b.createModule(.{
                     .root_source_file = b.path("src/root.zig"),
                     .target = b.graph.host,
+                    .link_libc = true,
                 }) }},
             }),
         });

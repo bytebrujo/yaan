@@ -106,6 +106,9 @@ The image is just the binary — no OS packages, no runtime, no source.
 
 ## Google Cloud Run
 
+**For a step-by-step walkthrough, see [deploy-gcp.md](deploy-gcp.md).** The rest
+of this section is the reference detail.
+
 Cloud Run is the natural managed target: it terminates TLS and forwards HTTP
 (exactly Yaan's upstream-TLS model), sets `$PORT` (the server binds it),
 injects env vars at runtime (matches Yaan's runtime env), and autoscales the

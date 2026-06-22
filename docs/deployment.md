@@ -104,6 +104,40 @@ docker run -e YAAN_COOKIE_SECRET=… -e DATABASE_URL=… -p 8080:8080 myapp
 
 The image is just the binary — no OS packages, no runtime, no source.
 
+## Google Cloud Run
+
+Cloud Run is the natural managed target: it terminates TLS and forwards HTTP
+(exactly Yaan's upstream-TLS model), sets `$PORT` (the server binds it),
+injects env vars at runtime (matches Yaan's runtime env), and autoscales the
+single container.
+
+```sh
+yaan add cloudrun                 # Dockerfile (Cloud Run entrypoint), .gcloudignore, deploy.sh
+yaan deploy gcp --project <id> --region us-central1 --service my-app \
+  --set-env-vars DATABASE_URL=...,YAAN_COOKIE_SECRET=...
+```
+
+`yaan deploy gcp` shells out to `gcloud run deploy --source .`, which uses
+Cloud Build to build the Dockerfile, push to Artifact Registry, and deploy —
+streaming gcloud's output live. `--dry-run` prints the exact command without
+running it; `sh deploy.sh` is the equivalent script. Requires the Google Cloud
+SDK (`gcloud auth login`).
+
+The generated Dockerfile runs the server with `--host 0.0.0.0 --trust-forwarded`
+so `--force-https`, HSTS, and secure cookies are correct behind Cloud Run's
+front-end (which overwrites `X-Forwarded-*` and has no fixed IP to put in
+`--trusted-proxy`). **Only enable `--trust-forwarded` behind such a proxy** — on
+a directly-exposed server a client could spoof the headers.
+
+**Build-context caveat.** `--source` builds in Cloud Build, whose context is the
+app directory. Your `yaan` dependency must be reachable from there — a published
+`url`+`hash` dependency, or the framework vendored into the build context. A
+local `.path` dependency pointing *outside* the app directory (as `yaan init`
+writes today, since the framework is unpublished) is not uploaded to Cloud Build
+and the build will fail to resolve it. Until the framework is published, either
+vendor it into the build context or build the image locally and deploy it with
+`gcloud run deploy --image` instead of `--source`.
+
 ## systemd
 
 `yaan add systemd` writes a hardened `yaan.service` (DynamicUser, PrivateTmp,

@@ -26,9 +26,27 @@ pub fn main(init: std.process.Init) !void {
         const target = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
         yaan.project.addDeployFile(init.io, allocator, target) catch |err| switch (err) {
             error.UnknownAddTarget => {
-                std.debug.print("usage: yaan add <docker|systemd>\n", .{});
+                std.debug.print("usage: yaan add <docker|systemd|cloudrun>\n", .{});
                 std.process.exit(1);
             },
+            else => return err,
+        };
+    } else if (std.mem.eql(u8, cmd, "deploy")) {
+        const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
+        if (!std.mem.eql(u8, sub, "gcp") and !std.mem.eql(u8, sub, "cloudrun")) {
+            std.debug.print("usage: yaan deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--no-allow-unauthenticated] [--dry-run]\n", .{});
+            std.process.exit(1);
+        }
+        yaan.project.deployCloudRun(init.io, allocator, .{
+            .service = optionValue(args, "--service") orelse "yaan-app",
+            .project = optionValue(args, "--project"),
+            .region = optionValue(args, "--region"),
+            .allow_unauthenticated = !optionFlag(args, "--no-allow-unauthenticated"),
+            .set_env_vars = optionValue(args, "--set-env-vars"),
+            .dry_run = optionFlag(args, "--dry-run"),
+        }) catch |err| switch (err) {
+            // Message already printed; exit without a trace.
+            error.GcloudNotFound, error.DeployFailed => std.process.exit(1),
             else => return err,
         };
     } else if (std.mem.eql(u8, cmd, "check")) {
@@ -80,6 +98,7 @@ fn runServer(
     const otel_endpoint = optionValue(args, "--otel-endpoint");
     const service_name = optionValue(args, "--otel-service") orelse "yaan-dev";
     const trusted_proxies = try optionList(allocator, args, "--trusted-proxy");
+    const trust_forwarded = optionFlag(args, "--trust-forwarded");
     const force_https = optionFlag(args, "--force-https");
     const hsts = optionFlag(args, "--hsts");
     const hsts_max_age = try parseU32Option(args, "--hsts-max-age", 31536000);
@@ -143,6 +162,7 @@ fn runServer(
         },
         .debug_errors = debug_errors,
         .trusted_proxies = trusted_proxies,
+        .trust_forwarded = trust_forwarded,
         .force_https = force_https,
         .hsts = hsts,
         .hsts_max_age = hsts_max_age,
@@ -209,7 +229,8 @@ fn usage() void {
         \\
         \\commands:
         \\  init [name]
-        \\  add <docker|systemd>             (emit deployment files for the single-binary artifact)
+        \\  add <docker|systemd|cloudrun>    (emit deployment files for the single-binary artifact)
+        \\  deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--dry-run]
         \\  check
         \\  build [--out dist] [--runners]   (--runners also compiles subprocess runner binaries for `yaan start`)
         \\  dev [--host 127.0.0.1] [--port 5173] [--otel-endpoint http://127.0.0.1:4318/v1/traces] [--otel-service yaan-dev] [--prod-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--hsts-max-age 31536000] [--csrf] [--cookie-secret secret] [--max-body bytes]

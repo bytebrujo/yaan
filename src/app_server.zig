@@ -98,10 +98,12 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
 
     const host = optionValue(args, "--host") orelse "127.0.0.1";
-    const port_text = optionValue(args, "--port") orelse "5173";
+    // Respect $PORT when --port is absent (Cloud Run and most PaaS set it).
+    const port_text = optionValue(args, "--port") orelse init.environ_map.get("PORT") orelse "5173";
     const port = try std.fmt.parseInt(u16, port_text, 10);
     const debug_errors = optionFlag(args, "--debug-errors");
     const trusted_proxies = try optionList(allocator, args, "--trusted-proxy");
+    const trust_forwarded = optionFlag(args, "--trust-forwarded");
     const force_https = optionFlag(args, "--force-https");
     const hsts = optionFlag(args, "--hsts");
     const hsts_max_age = try parseU32Option(args, "--hsts-max-age", 31_536_000);
@@ -165,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
         // build step passes it).
         .debug_errors = debug_errors,
         .trusted_proxies = trusted_proxies,
+        .trust_forwarded = trust_forwarded,
         .force_https = force_https,
         .hsts = hsts,
         .hsts_max_age = hsts_max_age,

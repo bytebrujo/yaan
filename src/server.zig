@@ -133,6 +133,10 @@ pub const StaticServerOptions = struct {
     max_header_length: usize = 32 * 1024,
     read_timeout_ms: u32 = 10_000,
     trusted_proxies: []const []const u8 = &.{},
+    /// Trust X-Forwarded-* from ANY peer (for platform front-ends like Cloud Run
+    /// that overwrite these headers but have no fixed proxy IP). Only safe behind
+    /// such a proxy; do not enable on a directly-exposed server.
+    trust_forwarded: bool = false,
     force_https: bool = false,
     hsts: bool = false,
     hsts_max_age: u32 = 31_536_000,
@@ -345,7 +349,7 @@ pub fn testRequest(io: std.Io, allocator: std.mem.Allocator, options: StaticServ
     const forwarded_host = nearestForwardedValue(requestHeader(request.headers, "x-forwarded-host") orelse "");
     const forwarded_port = nearestForwardedValue(requestHeader(request.headers, "x-forwarded-port") orelse "");
 
-    const security = try requestSecurity(allocator, request.peer, options.trusted_proxies, host, forwarded_proto, forwarded_host, forwarded_port);
+    const security = try requestSecurity(allocator, request.peer, options.trusted_proxies, options.trust_forwarded, host, forwarded_proto, forwarded_host, forwarded_port);
     defer if (security.host.ptr != host.ptr) allocator.free(security.host);
     if (options.force_https and !security.secure) {
         const location = try httpsRedirectLocation(allocator, security.host, target);
@@ -822,7 +826,7 @@ fn handleConnection(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net
         }
         return;
     }
-    const security = try requestSecurity(allocator, stream.socket.address, options.trusted_proxies, host, forwarded_proto, forwarded_host, forwarded_port);
+    const security = try requestSecurity(allocator, stream.socket.address, options.trusted_proxies, options.trust_forwarded, host, forwarded_proto, forwarded_host, forwarded_port);
     defer if (security.host.ptr != host.ptr) allocator.free(security.host);
     if (options.force_https and !security.secure) {
         const location = try httpsRedirectLocation(allocator, security.host, target);
@@ -1103,8 +1107,11 @@ fn sanitizePath(target: []const u8) []const u8 {
     return no_query;
 }
 
-fn requestSecurity(allocator: std.mem.Allocator, peer: std.Io.net.IpAddress, trusted_proxies: []const []const u8, host: []const u8, forwarded_proto: []const u8, forwarded_host: []const u8, forwarded_port: []const u8) !RequestSecurity {
-    const trust_forwarded = isTrustedProxy(peer, trusted_proxies);
+fn requestSecurity(allocator: std.mem.Allocator, peer: std.Io.net.IpAddress, trusted_proxies: []const []const u8, trust_any: bool, host: []const u8, forwarded_proto: []const u8, forwarded_host: []const u8, forwarded_port: []const u8) !RequestSecurity {
+    // `trust_any` is for platform front-ends (Cloud Run, an LB) that overwrite
+    // X-Forwarded-* and don't expose a fixed proxy IP for --trusted-proxy. ONLY
+    // safe when something upstream strips client-supplied forwarded headers.
+    const trust_forwarded = trust_any or isTrustedProxy(peer, trusted_proxies);
     if (!trust_forwarded) return .{ .secure = false, .host = host };
     const secure = std.ascii.eqlIgnoreCase(forwarded_proto, "https");
     const effective_host = if (forwarded_host.len > 0)
@@ -2163,6 +2170,7 @@ test "forwarded headers are ignored without trusted proxy" {
         std.testing.allocator,
         peer,
         &.{"127.0.0.1"},
+        false,
         "app.example.com",
         "https",
         "public.example.com",
@@ -2172,12 +2180,32 @@ test "forwarded headers are ignored without trusted proxy" {
     try std.testing.expectEqualStrings("app.example.com", security.host);
 }
 
+test "trust_forwarded honors X-Forwarded-Proto from any peer" {
+    const peer = try std.Io.net.IpAddress.parse("203.0.113.10", 49152);
+    const security = try requestSecurity(
+        std.testing.allocator,
+        peer,
+        &.{},
+        true, // trust_forwarded: platform front-end (e.g. Cloud Run)
+        "app.example.com",
+        "https",
+        "public.example.com",
+        "443",
+    );
+    // forwarded_host is set, so requestSecurity returns an allocated host.
+    defer std.testing.allocator.free(security.host);
+    try std.testing.expect(security.secure);
+    // :443 is dropped as the default HTTPS port.
+    try std.testing.expectEqualStrings("public.example.com", security.host);
+}
+
 test "trusted forwarded headers determine secure host" {
     const peer = try std.Io.net.IpAddress.parse("127.0.0.1", 49152);
     const security = try requestSecurity(
         std.testing.allocator,
         peer,
         &.{"127.0.0.1"},
+        false,
         "127.0.0.1:5173",
         "https",
         "app.example.com",
@@ -2194,6 +2222,7 @@ test "trusted forwarded headers use nearest proxy value" {
         std.testing.allocator,
         peer,
         &.{"127.0.0.1"},
+        false,
         "127.0.0.1:5173",
         nearestForwardedValue("http, https"),
         nearestForwardedValue("attacker.example, app.example.com"),

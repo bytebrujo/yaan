@@ -13,7 +13,7 @@ jobs:
 
       # Pin to the framework's minimum Zig. Bump alongside minimum_zig_version
       # in build.zig.zon. (If this action ref drifts, update it.)
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 

@@ -1,0 +1,32 @@
+name: Release
+
+# Publishing a Yaan release is just pushing a tag: consumers depend on it via
+#   zig fetch --save git+https://github.com/bytebrujo/yaan#vX.Y.Z
+# This workflow validates the tag builds/tests, then creates a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Validate the tagged commit
+        run: |
+          zig build test
+          cd examples/app && zig build test && zig build check
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --title "$TAG" --generate-notes

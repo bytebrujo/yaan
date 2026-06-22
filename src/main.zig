@@ -1,5 +1,6 @@
 const std = @import("std");
 const yaan = @import("yaan");
+const build_options = @import("build_options");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -9,21 +10,64 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "init")) {
         const name: ?[]const u8 = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else null;
-        yaan.project.writeExampleApp(init.io, allocator, name) catch |err| switch (err) {
+        const cwd_abs = init.environ_map.get("PWD") orelse "";
+        yaan.project.writeExampleApp(init.io, allocator, name, build_options.framework_root, cwd_abs) catch |err| switch (err) {
             // Message already printed by writeExampleApp; exit without a trace.
             error.PathAlreadyExists => std.process.exit(1),
             else => return err,
         };
+        const deploy_hint = "\n\nto build the deployable single binary:\n  zig build -Doptimize=ReleaseFast   (-> zig-out/bin/yaan-app; see `yaan add docker`)\n";
         if (name) |n| {
-            std.debug.print("created Yaan app '{s}'\n\nnext steps:\n  cd {s}\n  yaan dev\n", .{ n, n });
+            std.debug.print("created Yaan app '{s}'\n\nnext steps:\n  cd {s}\n  yaan dev{s}", .{ n, n, deploy_hint });
         } else {
-            std.debug.print("created Yaan app in the current directory\n\nnext steps:\n  yaan dev\n", .{});
+            std.debug.print("created Yaan app in the current directory\n\nnext steps:\n  yaan dev{s}", .{deploy_hint});
         }
+    } else if (std.mem.eql(u8, cmd, "add")) {
+        const target = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
+        yaan.project.addDeployFile(init.io, allocator, target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
+            error.UnknownAddTarget => {
+                std.debug.print("usage: yaan add <docker|systemd|cloudrun>\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+    } else if (std.mem.eql(u8, cmd, "deploy")) {
+        const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
+        if (!std.mem.eql(u8, sub, "gcp") and !std.mem.eql(u8, sub, "cloudrun")) {
+            std.debug.print("usage: yaan deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--no-allow-unauthenticated] [--skip-dep-check] [--dry-run]\n", .{});
+            std.process.exit(1);
+        }
+        yaan.project.deployCloudRun(init.io, allocator, .{
+            .service = optionValue(args, "--service") orelse "yaan-app",
+            .project = optionValue(args, "--project"),
+            .region = optionValue(args, "--region"),
+            .allow_unauthenticated = !optionFlag(args, "--no-allow-unauthenticated"),
+            .set_env_vars = optionValue(args, "--set-env-vars"),
+            .dry_run = optionFlag(args, "--dry-run"),
+            .framework_url = build_options.framework_url,
+            .framework_version = build_options.framework_version,
+            .skip_dep_check = optionFlag(args, "--skip-dep-check"),
+        }) catch |err| switch (err) {
+            // Message already printed; exit without a trace.
+            error.GcloudNotFound, error.DeployFailed, error.LocalPathDependency => std.process.exit(1),
+            else => return err,
+        };
     } else if (std.mem.eql(u8, cmd, "check")) {
         try runCheck(init.io, allocator);
     } else if (std.mem.eql(u8, cmd, "build")) {
         const out = optionValue(args, "--out") orelse "dist";
         try yaan.project.buildProject(init.io, allocator, out);
+        if (optionFlag(args, "--runners")) {
+            // Compile the subprocess runner binaries as part of the build so
+            // `yaan start` never needs the Zig toolchain at boot. The in-process
+            // deploy artifact links its handlers in and never uses these, so
+            // they stay opt-in (plain `yaan build` stays fast for tests + the
+            // in-process build).
+            try yaan.project.buildDevLoadRunner(init.io, allocator);
+            try yaan.project.buildDevActionRunner(init.io, allocator);
+            try yaan.project.buildDevRemoteRunner(init.io, allocator);
+            try yaan.project.buildDevHookRunner(init.io, allocator);
+        }
         std.debug.print("built {s}\n", .{out});
     } else if (std.mem.eql(u8, cmd, "dev")) {
         try runServer(init.io, allocator, args, init.environ_map.get("YAAN_COOKIE_SECRET"), .dev);
@@ -57,6 +101,7 @@ fn runServer(
     const otel_endpoint = optionValue(args, "--otel-endpoint");
     const service_name = optionValue(args, "--otel-service") orelse "yaan-dev";
     const trusted_proxies = try optionList(allocator, args, "--trusted-proxy");
+    const trust_forwarded = optionFlag(args, "--trust-forwarded");
     const force_https = optionFlag(args, "--force-https");
     const hsts = optionFlag(args, "--hsts");
     const hsts_max_age = try parseU32Option(args, "--hsts-max-age", 31536000);
@@ -79,20 +124,29 @@ fn runServer(
     };
 
     switch (mode) {
-        .dev => try yaan.project.buildProject(io, allocator, "dist"),
+        // dev is a toolchain context: rebuild dist/ and (re)compile the runners
+        // on every run so edits are picked up.
+        .dev => {
+            try yaan.project.buildProject(io, allocator, "dist");
+            try yaan.project.buildDevLoadRunner(io, allocator);
+            try yaan.project.buildDevActionRunner(io, allocator);
+            try yaan.project.buildDevRemoteRunner(io, allocator);
+            try yaan.project.buildDevHookRunner(io, allocator);
+        },
+        // start serves a prior `yaan build --runners`. It must NOT invoke the
+        // Zig toolchain at boot, so it only verifies the build output exists.
         .start => {
             const cwd = std.Io.Dir.cwd();
             cwd.access(io, "dist", .{}) catch {
-                std.debug.print("no dist/ found; run `yaan build` first\n", .{});
+                std.debug.print("no dist/ found; run `yaan build --runners` first\n", .{});
                 return error.MissingBuild;
             };
         },
     }
-    try yaan.project.buildDevLoadRunner(io, allocator);
-    try yaan.project.buildDevActionRunner(io, allocator);
-    try yaan.project.buildDevRemoteRunner(io, allocator);
-    try yaan.project.buildDevHookRunner(io, allocator);
-    try yaan.server.serve(io, allocator, .{
+    // The server bases each connection's request arena on this allocator; use a
+    // thread-safe, reclaiming allocator so concurrent requests free their memory
+    // (init.arena never reclaims). Setup above keeps using the process arena.
+    try yaan.server.serve(io, std.heap.smp_allocator, .{
         .host = host,
         .port = port,
         .label = switch (mode) {
@@ -111,6 +165,7 @@ fn runServer(
         },
         .debug_errors = debug_errors,
         .trusted_proxies = trusted_proxies,
+        .trust_forwarded = trust_forwarded,
         .force_https = force_https,
         .hsts = hsts,
         .hsts_max_age = hsts_max_age,
@@ -177,10 +232,12 @@ fn usage() void {
         \\
         \\commands:
         \\  init [name]
+        \\  add <docker|systemd|cloudrun>    (emit deployment files for the single-binary artifact)
+        \\  deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--dry-run]
         \\  check
-        \\  build [--out dist]
+        \\  build [--out dist] [--runners]   (--runners also compiles subprocess runner binaries for `yaan start`)
         \\  dev [--host 127.0.0.1] [--port 5173] [--otel-endpoint http://127.0.0.1:4318/v1/traces] [--otel-service yaan-dev] [--prod-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--hsts-max-age 31536000] [--csrf] [--cookie-secret secret] [--max-body bytes]
-        \\  start [--host 127.0.0.1] [--port 5173] [--debug-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--csrf] [--cookie-secret secret]  (serve a prior `yaan build`)
+        \\  start [--host 127.0.0.1] [--port 5173] [--debug-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--csrf] [--cookie-secret secret]  (serve a prior `yaan build --runners`)
         \\
     , .{});
 }

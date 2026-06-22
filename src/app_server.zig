@@ -14,6 +14,8 @@ const std = @import("std");
 const yaan = @import("yaan");
 const hooks = @import("hooks");
 const app_hooks = @import("app_hooks");
+const env = @import("env");
+const dist_embed = @import("dist_embed");
 const load_runner = @import("load_runner");
 const action_runner = @import("action_runner");
 const remote_runner = @import("remote_runner");
@@ -96,10 +98,12 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
 
     const host = optionValue(args, "--host") orelse "127.0.0.1";
-    const port_text = optionValue(args, "--port") orelse "5173";
+    // Respect $PORT when --port is absent (Cloud Run and most PaaS set it).
+    const port_text = optionValue(args, "--port") orelse init.environ_map.get("PORT") orelse "5173";
     const port = try std.fmt.parseInt(u16, port_text, 10);
     const debug_errors = optionFlag(args, "--debug-errors");
     const trusted_proxies = try optionList(allocator, args, "--trusted-proxy");
+    const trust_forwarded = optionFlag(args, "--trust-forwarded");
     const force_https = optionFlag(args, "--force-https");
     const hsts = optionFlag(args, "--hsts");
     const hsts_max_age = try parseU32Option(args, "--hsts-max-age", 31_536_000);
@@ -114,15 +118,45 @@ pub fn main(init: std.process.Init) !void {
     const csrf_protection = optionFlag(args, "--csrf");
     if (csrf_protection and cookie_secret.len == 0) return error.MissingCookieSecret;
 
-    // Generate the app's dist + .yaan artifacts. No runner SUBPROCESSES are
-    // built — hook, load, action, and remote all run in-process now.
-    try yaan.project.buildProject(io, allocator, "dist");
+    // Escape hatch: serve the built assets from this directory on disk instead of
+    // the embedded copy (e.g. a volume-mounted dist/ kept in sync with a CDN, or
+    // to swap assets without rebuilding). Defaults to the embedded dist/.
+    const assets_dir = optionValue(args, "--assets-dir");
+
+    // The deploy artifact does NOT build at boot. When serving the embedded dist/
+    // it needs nothing on disk; with --assets-dir it serves that directory. Fail
+    // fast if neither has content rather than serving an empty site.
+    if (assets_dir == null and dist_embed.entries.len == 0) {
+        std.debug.print("no embedded assets; run `zig build` (which runs `yaan build`) before starting\n", .{});
+        std.process.exit(1);
+    }
+    if (assets_dir) |dir| {
+        std.Io.Dir.cwd().access(io, dir, .{}) catch {
+            std.debug.print("--assets-dir '{s}' not found\n", .{dir});
+            std.process.exit(1);
+        };
+    }
+
+    // Resolve runtime (private, non-static) env vars from this process's
+    // environment before serving. One init() populates the shared `env` module
+    // for every linked-in handler (load/action/remote/hook), so the same binary
+    // serves different environments by varying the process env — no rebuild.
+    env.init(init.environ_map) catch |err| {
+        std.debug.print("env init failed: {t}\n", .{err});
+        std.process.exit(1);
+    };
 
     std.debug.print("yaan in-process server (hooks+load+action+remote linked) on http://{s}:{d}\n", .{ host, port });
-    try yaan.server.serve(io, allocator, .{
+    // Per-connection request arenas are based on a thread-safe, reclaiming
+    // allocator so concurrent requests free their memory (init.arena, used for
+    // startup above, never reclaims).
+    try yaan.server.serve(io, std.heap.smp_allocator, .{
         .host = host,
         .port = port,
-        .root = "dist",
+        // With --assets-dir, serve that directory from disk; otherwise serve the
+        // embedded dist/ from inside the binary (no filesystem).
+        .root = assets_dir orelse "dist",
+        .assets = if (assets_dir == null) &dist_embed.lookup else null,
         .hook = &userHook,
         .load = &loadFn,
         .action = &actionFn,
@@ -133,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
         // build step passes it).
         .debug_errors = debug_errors,
         .trusted_proxies = trusted_proxies,
+        .trust_forwarded = trust_forwarded,
         .force_https = force_https,
         .hsts = hsts,
         .hsts_max_age = hsts_max_age,

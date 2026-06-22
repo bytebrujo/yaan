@@ -255,6 +255,12 @@ pub fn build(b: *std.Build) void {
     // scaffold.
     const cli_options = b.addOptions();
     cli_options.addOption([]const u8, "framework_root", b.build_root.path orelse ".");
+    // Published framework coordinates, baked so the CLI can tell scaffolded apps
+    // exactly how to depend on a released version (needed for Cloud Build). Forks
+    // override with -Dframework-url; keep -Dframework-version in sync with the
+    // .version in build.zig.zon.
+    cli_options.addOption([]const u8, "framework_url", b.option([]const u8, "framework-url", "Published framework repo URL") orelse "https://github.com/bytebrujo/yaan");
+    cli_options.addOption([]const u8, "framework_version", b.option([]const u8, "framework-version", "Published framework version tag") orelse "0.1.0");
 
     const exe = b.addExecutable(.{
         .name = "yaan",

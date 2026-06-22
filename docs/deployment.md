@@ -133,10 +133,17 @@ a directly-exposed server a client could spoof the headers.
 app directory. Your `yaan` dependency must be reachable from there — a published
 `url`+`hash` dependency, or the framework vendored into the build context. A
 local `.path` dependency pointing *outside* the app directory (as `yaan init`
-writes today, since the framework is unpublished) is not uploaded to Cloud Build
-and the build will fail to resolve it. Until the framework is published, either
-vendor it into the build context or build the image locally and deploy it with
-`gcloud run deploy --image` instead of `--source`.
+writes for local development) is not uploaded to Cloud Build and the build will
+fail to resolve it. The fix is to depend on a **published** framework version:
+
+```sh
+zig fetch --save git+https://github.com/bytebrujo/yaan#v0.1.0
+```
+
+`yaan add cloudrun` prints this command for the framework's current version. See
+[releasing.md](releasing.md) for how releases are cut. (Alternatively, vendor the
+framework into the build context, or build the image locally and deploy it with
+`gcloud run deploy --image` instead of `--source`.)
 
 ## systemd
 

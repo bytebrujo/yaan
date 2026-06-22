@@ -787,7 +787,7 @@ pub fn buildDevHookRunner(io: std.Io, allocator: std.mem.Allocator) !void {
 /// app root, targeting the in-process single-binary artifact (TLS terminated
 /// upstream, dist/ embedded, private env at runtime). Existing files are left
 /// untouched.
-pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u8) !void {
+pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u8, framework_url: []const u8, framework_version: []const u8) !void {
     _ = allocator;
     const cwd = std.Io.Dir.cwd();
     if (std.mem.eql(u8, target, "docker")) {
@@ -804,11 +804,11 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
             \\Cloud Run notes:
             \\  - Deploy with `yaan deploy gcp --project <id> --region <region>` or `sh deploy.sh`.
             \\  - `gcloud run deploy --source` builds in Cloud Build, whose context is THIS
-            \\    directory. Your `yaan` dependency must be reachable from there — a published
-            \\    url+hash dependency, or vendor the framework into the build context. A local
-            \\    `.path` dependency outside this dir will NOT be visible to Cloud Build.
+            \\    directory, so a local `.path` framework dependency is NOT visible there.
+            \\    Depend on the published framework instead (replaces the .path dep):
+            \\      zig fetch --save git+{s}#v{s}
             \\
-        , .{});
+        , .{ framework_url, framework_version });
     } else {
         return error.UnknownAddTarget;
     }

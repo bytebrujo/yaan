@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (std.mem.eql(u8, cmd, "add")) {
         const target = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
-        yaan.project.addDeployFile(init.io, allocator, target) catch |err| switch (err) {
+        yaan.project.addDeployFile(init.io, allocator, target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
             error.UnknownAddTarget => {
                 std.debug.print("usage: yaan add <docker|systemd|cloudrun>\n", .{});
                 std.process.exit(1);

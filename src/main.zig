@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
         if (!std.mem.eql(u8, sub, "gcp") and !std.mem.eql(u8, sub, "cloudrun")) {
-            std.debug.print("usage: yaan deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--no-allow-unauthenticated] [--dry-run]\n", .{});
+            std.debug.print("usage: yaan deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--no-allow-unauthenticated] [--skip-dep-check] [--dry-run]\n", .{});
             std.process.exit(1);
         }
         yaan.project.deployCloudRun(init.io, allocator, .{
@@ -44,9 +44,12 @@ pub fn main(init: std.process.Init) !void {
             .allow_unauthenticated = !optionFlag(args, "--no-allow-unauthenticated"),
             .set_env_vars = optionValue(args, "--set-env-vars"),
             .dry_run = optionFlag(args, "--dry-run"),
+            .framework_url = build_options.framework_url,
+            .framework_version = build_options.framework_version,
+            .skip_dep_check = optionFlag(args, "--skip-dep-check"),
         }) catch |err| switch (err) {
             // Message already printed; exit without a trace.
-            error.GcloudNotFound, error.DeployFailed => std.process.exit(1),
+            error.GcloudNotFound, error.DeployFailed, error.LocalPathDependency => std.process.exit(1),
             else => return err,
         };
     } else if (std.mem.eql(u8, cmd, "check")) {

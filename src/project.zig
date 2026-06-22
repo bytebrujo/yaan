@@ -964,6 +964,13 @@ pub const CloudRunDeploy = struct {
     /// Passed straight to `gcloud run deploy --set-env-vars` (e.g. "K=V,K2=V2").
     set_env_vars: ?[]const u8,
     dry_run: bool,
+    /// Baked framework coordinates, used to print the fix command when the app
+    /// uses a local `.path` dependency Cloud Build cannot reach.
+    framework_url: []const u8,
+    framework_version: []const u8,
+    /// Skip the local-path-dependency preflight (e.g. when the framework is
+    /// vendored into the build context).
+    skip_dep_check: bool,
 };
 
 /// Deploys the app to Google Cloud Run by shelling out to `gcloud run deploy
@@ -980,6 +987,11 @@ pub fn deployCloudRun(io: std.Io, allocator: std.mem.Allocator, opts: CloudRunDe
     if (opts.region) |r| try argv.appendSlice(allocator, &.{ "--region", r });
     try argv.append(allocator, if (opts.allow_unauthenticated) "--allow-unauthenticated" else "--no-allow-unauthenticated");
     if (opts.set_env_vars) |e| try argv.appendSlice(allocator, &.{ "--set-env-vars", e });
+
+    // Preflight (real deploys only): a local `.path` framework dependency isn't
+    // uploaded to Cloud Build, so `--source` would fail to resolve it. Catch it
+    // before printing/spawning instead of after the (slow) build.
+    if (!opts.dry_run and !opts.skip_dep_check) try checkCloudBuildReachable(io, allocator, opts.framework_url, opts.framework_version);
 
     // Print the exact command for transparency.
     var line: std.ArrayList(u8) = .empty;
@@ -1002,6 +1014,30 @@ pub fn deployCloudRun(io: std.Io, allocator: std.mem.Allocator, opts: CloudRunDe
     switch (term) {
         .exited => |code| if (code != 0) return error.DeployFailed,
         else => return error.DeployFailed,
+    }
+}
+
+/// Errors if the app's `yaan` dependency is a local `.path` (Cloud Build can't
+/// reach it). A `git+` URL dependency is reachable. Missing/unreadable
+/// build.zig.zon does not block (a vendored or unusual setup may be fine).
+fn checkCloudBuildReachable(io: std.Io, allocator: std.mem.Allocator, framework_url: []const u8, framework_version: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const data = cwd.readFileAlloc(io, "build.zig.zon", allocator, .limited(64 * 1024)) catch return;
+    defer allocator.free(data);
+    // A git URL dependency is fetched by Cloud Build — reachable.
+    if (std.mem.indexOf(u8, data, "git+") != null) return;
+    // The dependency path field is `.path = "..."`; the package's own top-level
+    // `.paths = .{` does not match this needle, so it is not a false positive.
+    if (std.mem.indexOf(u8, data, ".path = \"") != null) {
+        std.debug.print(
+            \\error: this app uses a local `.path` framework dependency, which Cloud
+            \\Build cannot reach (its build context is this directory). Depend on the
+            \\published framework first:
+            \\  zig fetch --save git+{s}#v{s}
+            \\then re-run, or pass --skip-dep-check to deploy anyway.
+            \\
+        , .{ framework_url, framework_version });
+        return error.LocalPathDependency;
     }
 }
 

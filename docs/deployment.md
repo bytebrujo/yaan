@@ -121,7 +121,9 @@ yaan deploy gcp --project <id> --region us-central1 --service my-app \
 Cloud Build to build the Dockerfile, push to Artifact Registry, and deploy —
 streaming gcloud's output live. `--dry-run` prints the exact command without
 running it; `sh deploy.sh` is the equivalent script. Requires the Google Cloud
-SDK (`gcloud auth login`).
+SDK (`gcloud auth login`). It preflights for a local `.path` framework
+dependency (which Cloud Build can't reach, see below) and refuses early with the
+fix command — pass `--skip-dep-check` to override (e.g. when vendoring).
 
 The generated Dockerfile runs the server with `--host 0.0.0.0 --trust-forwarded`
 so `--force-https`, HSTS, and secure cookies are correct behind Cloud Run's

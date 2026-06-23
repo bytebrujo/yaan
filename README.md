@@ -38,10 +38,17 @@ YAAN_COOKIE_SECRET=… ./zig-out/bin/yaan-app --host 0.0.0.0 --port 8080
 ```
 
 It handles requests concurrently, serves `GET /healthz`, and drains in-flight
-requests on SIGTERM. `yaan add docker` / `yaan add systemd` / `yaan add cloudrun`
-emit deployment files, and `yaan deploy gcp` deploys to Google Cloud Run via
-`gcloud`. **Deploy to GCP: [docs/deploy-gcp.md](docs/deploy-gcp.md). Full guide:
-[docs/deployment.md](docs/deployment.md).**
+requests on SIGTERM. `yaan add docker` / `systemd` / `cloudrun` / `azure` emit
+deployment files, and one command ships the single binary to a managed target —
+no container registry:
+
+- **[Google Cloud Run](docs/deploy-gcp.md)** — `yaan deploy gcp` (via `gcloud`).
+- **[Azure Functions](docs/deploy-azure.md)** — `yaan deploy azure` (via `az`).
+- 🚧 *Coming soon:* **[Tencent Cloud SCF](docs/deploy-tencent.md)**
+  (`yaan deploy tencent`) and **[Alibaba Function Compute](docs/deploy-alibaba.md)**
+  (`yaan deploy alibaba`) — implemented, pending live validation.
+
+**Full guide: [docs/deployment.md](docs/deployment.md).**
 
 The subprocess model is the alternative: `yaan build --runners` then `yaan
 start` (serves `dist/` from disk; the `--runners` build means `start` needs no

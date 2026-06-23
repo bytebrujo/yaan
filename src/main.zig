@@ -26,32 +26,82 @@ pub fn main(init: std.process.Init) !void {
         const target = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
         yaan.project.addDeployFile(init.io, allocator, target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
             error.UnknownAddTarget => {
-                std.debug.print("usage: yaan add <docker|systemd|cloudrun>\n", .{});
+                std.debug.print("usage: yaan add <docker|systemd|cloudrun|tencent|alibaba|azure>\n", .{});
                 std.process.exit(1);
             },
             else => return err,
         };
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
-        if (!std.mem.eql(u8, sub, "gcp") and !std.mem.eql(u8, sub, "cloudrun")) {
-            std.debug.print("usage: yaan deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--no-allow-unauthenticated] [--skip-dep-check] [--dry-run]\n", .{});
+        if (std.mem.eql(u8, sub, "gcp") or std.mem.eql(u8, sub, "cloudrun")) {
+            yaan.project.deployCloudRun(init.io, allocator, .{
+                .service = optionValue(args, "--service") orelse "yaan-app",
+                .project = optionValue(args, "--project"),
+                .region = optionValue(args, "--region"),
+                .allow_unauthenticated = !optionFlag(args, "--no-allow-unauthenticated"),
+                .set_env_vars = optionValue(args, "--set-env-vars"),
+                .dry_run = optionFlag(args, "--dry-run"),
+                .framework_url = build_options.framework_url,
+                .framework_version = build_options.framework_version,
+                .skip_dep_check = optionFlag(args, "--skip-dep-check"),
+            }) catch |err| switch (err) {
+                // Message already printed; exit without a trace.
+                error.GcloudNotFound, error.DeployFailed, error.LocalPathDependency => std.process.exit(1),
+                else => return err,
+            };
+        } else if (std.mem.eql(u8, sub, "tencent") or std.mem.eql(u8, sub, "scf")) {
+            yaan.project.deployTencentScf(init.io, allocator, .{
+                .function = optionValue(args, "--function") orelse optionValue(args, "--service") orelse "yaan-app",
+                .region = optionValue(args, "--region"),
+                .namespace = optionValue(args, "--namespace") orelse "default",
+                .memory = optionValue(args, "--memory"),
+                .role = optionValue(args, "--role") orelse "SCF_QcsRole",
+                .set_env_vars = optionValue(args, "--set-env-vars"),
+                .dry_run = optionFlag(args, "--dry-run"),
+            }) catch |err| switch (err) {
+                // Message already printed (by the deploy script); exit without a trace.
+                error.DeployFailed => std.process.exit(1),
+                else => return err,
+            };
+        } else if (std.mem.eql(u8, sub, "alibaba") or std.mem.eql(u8, sub, "aliyun") or std.mem.eql(u8, sub, "fc")) {
+            yaan.project.deployAlibabaFc(init.io, allocator, .{
+                .function = optionValue(args, "--function") orelse optionValue(args, "--service") orelse "yaan-app",
+                .region = optionValue(args, "--region"),
+                .memory = optionValue(args, "--memory"),
+                .cpu = optionValue(args, "--cpu"),
+                .oss_bucket = optionValue(args, "--oss-bucket"),
+                .role = optionValue(args, "--role"),
+                .set_env_vars = optionValue(args, "--set-env-vars"),
+                .dry_run = optionFlag(args, "--dry-run"),
+            }) catch |err| switch (err) {
+                // Message already printed (by the deploy script); exit without a trace.
+                error.DeployFailed => std.process.exit(1),
+                else => return err,
+            };
+        } else if (std.mem.eql(u8, sub, "azure")) {
+            yaan.project.deployAzureFunctions(init.io, allocator, .{
+                .function = optionValue(args, "--function") orelse optionValue(args, "--service"),
+                .region = optionValue(args, "--region"),
+                .resource_group = optionValue(args, "--resource-group"),
+                .storage_account = optionValue(args, "--storage-account"),
+                .set_env_vars = optionValue(args, "--set-env-vars"),
+                .dry_run = optionFlag(args, "--dry-run"),
+            }) catch |err| switch (err) {
+                // Message already printed (by the deploy script); exit without a trace.
+                error.DeployFailed => std.process.exit(1),
+                else => return err,
+            };
+        } else {
+            std.debug.print(
+                \\usage: yaan deploy <target> [options]
+                \\  gcp      [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--no-allow-unauthenticated] [--skip-dep-check] [--dry-run]
+                \\  tencent  [--function NAME] [--region R] [--namespace NS] [--memory MB] [--role NAME] [--set-env-vars K=V,...] [--dry-run]
+                \\  alibaba  [--function NAME] [--region R] [--memory MB] [--cpu vCPU] [--oss-bucket NAME] [--role ARN] [--set-env-vars K=V,...] [--dry-run]
+                \\  azure    [--function NAME] [--region R] [--resource-group NAME] [--storage-account NAME] [--set-env-vars K=V,...] [--dry-run]
+                \\
+            , .{});
             std.process.exit(1);
         }
-        yaan.project.deployCloudRun(init.io, allocator, .{
-            .service = optionValue(args, "--service") orelse "yaan-app",
-            .project = optionValue(args, "--project"),
-            .region = optionValue(args, "--region"),
-            .allow_unauthenticated = !optionFlag(args, "--no-allow-unauthenticated"),
-            .set_env_vars = optionValue(args, "--set-env-vars"),
-            .dry_run = optionFlag(args, "--dry-run"),
-            .framework_url = build_options.framework_url,
-            .framework_version = build_options.framework_version,
-            .skip_dep_check = optionFlag(args, "--skip-dep-check"),
-        }) catch |err| switch (err) {
-            // Message already printed; exit without a trace.
-            error.GcloudNotFound, error.DeployFailed, error.LocalPathDependency => std.process.exit(1),
-            else => return err,
-        };
     } else if (std.mem.eql(u8, cmd, "check")) {
         try runCheck(init.io, allocator);
     } else if (std.mem.eql(u8, cmd, "build")) {
@@ -232,8 +282,11 @@ fn usage() void {
         \\
         \\commands:
         \\  init [name]
-        \\  add <docker|systemd|cloudrun>    (emit deployment files for the single-binary artifact)
+        \\  add <docker|systemd|cloudrun|tencent|alibaba|azure>    (emit deployment files for the single-binary artifact)
         \\  deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--dry-run]
+        \\  deploy tencent [--function NAME] [--region R] [--memory MB] [--set-env-vars K=V,...] [--dry-run]
+        \\  deploy alibaba [--function NAME] [--region R] [--memory MB] [--oss-bucket NAME] [--set-env-vars K=V,...] [--dry-run]
+        \\  deploy azure [--function NAME] [--region R] [--resource-group NAME] [--set-env-vars K=V,...] [--dry-run]
         \\  check
         \\  build [--out dist] [--runners]   (--runners also compiles subprocess runner binaries for `yaan start`)
         \\  dev [--host 127.0.0.1] [--port 5173] [--otel-endpoint http://127.0.0.1:4318/v1/traces] [--otel-service yaan-dev] [--prod-errors] [--trusted-proxy 127.0.0.1,::1] [--force-https] [--hsts] [--hsts-max-age 31536000] [--csrf] [--cookie-secret secret] [--max-body bytes]

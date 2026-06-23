@@ -150,6 +150,129 @@ zig fetch --save git+https://github.com/bytebrujo/yaan#v0.1.0
 framework into the build context, or build the image locally and deploy it with
 `gcloud run deploy --image` instead of `--source`.)
 
+## Azure Functions
+
+**For a step-by-step walkthrough, see [deploy-azure.md](deploy-azure.md).** The
+rest of this section is the reference detail.
+
+Azure Functions is the managed target in Azure: deployed as a **custom handler**
+(your binary is the HTTP server), it terminates TLS and forwards HTTP, injects
+app settings as env vars at runtime, and autoscales to zero on the Consumption
+plan. No container registry — the static single binary is zip-deployed.
+
+```sh
+yaan add azure                    # bootstrap (launcher), host.json, deploy.azure.sh
+yaan deploy azure --region eastus --function my-app \
+  --set-env-vars DATABASE_URL=...,YAAN_COOKIE_SECRET=...
+```
+
+`yaan deploy azure` runs `deploy.azure.sh`: it builds the static binary, ensures
+a resource group + storage account + function app exist (Functions requires a
+storage account; both auto-created), disables the server-side Oryx build, zips
+`host.json` + a `bootstrap` launcher + the binary + a catch-all HTTP function,
+and zip-deploys via `az`, then prints `https://<app>.azurewebsites.net`.
+`--dry-run` prints the steps without building or mutating; `sh deploy.azure.sh`
+is the equivalent script (settings via `FUNCTION`/`REGION`/`RESOURCE_GROUP`/
+`STORAGE_ACCOUNT`/`SET_ENV_VARS` env vars). Requires the Azure CLI (`az login`).
+
+`bootstrap` runs the server with `--host 0.0.0.0 --port
+"$FUNCTIONS_CUSTOMHANDLER_PORT" --trust-forwarded`: Azure proxies HTTP to that
+port and forwards `X-Forwarded-*`, so `--force-https`, HSTS, and secure cookies
+are correct. **Only enable `--trust-forwarded` behind such a proxy.** `host.json`
+sets `enableForwardingHttpRequest` (the raw request reaches the binary) and an
+empty `routePrefix` (so the app serves at `/`, not `/api`).
+
+**Build note.** Custom handlers ship a built binary, not source, so the deploy
+disables the server-side Oryx build (`SCM_DO_BUILD_DURING_DEPLOYMENT=false`,
+`ENABLE_ORYX_BUILD=false`) — otherwise the zip deploy fails with "Could not
+detect runtime".
+
+## Coming soon
+
+> 🚧 **These targets are implemented and dry-run-verified, but not yet validated
+> against a live deploy** — each is blocked on cloud-account setup (see each
+> section). The CLI commands work today; the flows below are the intended usage.
+
+### Tencent Cloud SCF
+
+**For a step-by-step walkthrough, see [deploy-tencent.md](deploy-tencent.md).**
+The rest of this section is the reference detail.
+
+SCF (Serverless Cloud Functions) is the natural managed target in Tencent Cloud:
+deployed as an HTTP **web function**, it terminates TLS and forwards HTTP
+(exactly Yaan's upstream-TLS model), injects env vars at runtime, and autoscales
+to zero. Unlike Cloud Run there is **no container registry** — the static single
+binary is uploaded directly in the function's code zip (~3 MB, under SCF's 50 MB
+limit).
+
+```sh
+yaan add tencent                  # scf_bootstrap (launcher), deploy.tencent.sh
+yaan deploy tencent --region ap-guangzhou --function my-app \
+  --set-env-vars DATABASE_URL=...,YAAN_COOKIE_SECRET=...
+```
+
+`yaan deploy tencent` runs `deploy.tencent.sh`: it builds the static binary,
+zips it with an `scf_bootstrap` launcher, then creates the web function (or
+updates its code if it exists) via `tccli`, waits for `Active`, and prints the
+URL. `--dry-run` prints the steps without building or mutating; `sh
+deploy.tencent.sh` is the equivalent script (settings via `FUNCTION`/`REGION`/
+`MEMORY`/`SET_ENV_VARS`/… env vars). Requires the Tencent Cloud CLI
+(`tccli configure`).
+
+`scf_bootstrap` runs the server with `--host 0.0.0.0 --port 9000
+--trust-forwarded`: SCF proxies HTTP to `:9000` and overwrites `X-Forwarded-*`,
+so `--force-https`, HSTS, and secure cookies are correct. **Only enable
+`--trust-forwarded` behind such a proxy** — on a directly-exposed server a client
+could spoof the headers.
+
+SCF web functions reject the `CustomRuntime` token, so the deploy declares a
+standard web runtime (`Go1`) purely as a carrier and lets `scf_bootstrap` drive
+startup — the static-musl binary needs nothing from the base image.
+
+**Account setup.** A first-time account needs **real-name authentication**
+(实名认证, a one-time console step) and an **SCF execution role** (`SCF_QcsRole`
+by default, or pass `--role`) before any function can be created. See
+[deploy-tencent.md](deploy-tencent.md) for the exact CLI commands.
+
+### Alibaba Cloud Function Compute
+
+**For a step-by-step walkthrough, see [deploy-alibaba.md](deploy-alibaba.md).**
+The rest of this section is the reference detail.
+
+Function Compute (FC 3.0) is the managed target in Alibaba Cloud: deployed as a
+custom-runtime **HTTP function**, it terminates TLS and forwards HTTP, injects
+env vars at runtime, and autoscales to zero. As with the other serverless
+targets there is no container registry — the static single binary is uploaded as
+the function's code.
+
+```sh
+yaan add alibaba                  # bootstrap (launcher), deploy.alibaba.sh
+yaan deploy alibaba --region ap-southeast-1 --function my-app \
+  --set-env-vars DATABASE_URL=...,YAAN_COOKIE_SECRET=...
+```
+
+`yaan deploy alibaba` runs `deploy.alibaba.sh`: it builds the static binary, zips
+it with a `bootstrap` launcher, uploads the zip to **OSS** (FC reads code from
+there — the `aliyun` CLI can't inline a multi-MB zip past `ARG_MAX`), then
+creates the FC function (or updates its code) and an anonymous HTTP trigger, and
+prints the URL. `--dry-run` prints the steps without building or mutating; `sh
+deploy.alibaba.sh` is the equivalent script (settings via `FUNCTION`/`REGION`/
+`MEMORY`/`CPU`/`OSS_BUCKET`/`SET_ENV_VARS`/… env vars). Requires the Alibaba
+Cloud CLI (`aliyun configure`).
+
+`bootstrap` runs the server with `--host 0.0.0.0 --port 9000 --trust-forwarded`:
+FC proxies HTTP to `:9000` and forwards `X-Forwarded-*`, so `--force-https`,
+HSTS, and secure cookies are correct. **Only enable `--trust-forwarded` behind
+such a proxy.** The runtime is declared `custom.debian10` purely as a carrier —
+the static-musl binary needs nothing from the base image, and `bootstrap` is
+what FC runs.
+
+**Permissions.** The deploy auto-creates an OSS bucket (`yaan-fc-<accountid>`, or
+pass `--oss-bucket`) and uploads the code there, so the credentials need **FC +
+OSS** permissions (`AliyunFCFullAccess` + `AliyunOSSFullAccess`, or the
+least-privilege set in [deploy-alibaba.md](deploy-alibaba.md)). International
+accounts in regions like `ap-southeast-1` skip the mainland real-name step.
+
 ## systemd
 
 `yaan add systemd` writes a hardened `yaan.service` (DynamicUser, PrivateTmp,

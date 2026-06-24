@@ -802,10 +802,11 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
         std.debug.print(
             \\
             \\Cloud Run notes:
-            \\  - Deploy with `yaan deploy gcp --project <id> --region <region>` or `sh deploy.sh`.
+            \\  - Deploy with `yaan deploy gcp --project <id> --region <region>` or `bash ./deploy.sh`.
             \\  - `gcloud run deploy --source` builds in Cloud Build, whose context is THIS
-            \\    directory, so a local `.path` framework dependency is NOT visible there.
-            \\    Depend on the published framework instead (replaces the .path dep):
+            \\    directory. The preflight only checks the app's `yaan` dependency:
+            \\    a `.path` inside this directory is OK; a `.path` outside it is not
+            \\    uploaded. Usually, depend on the published framework instead:
             \\      zig fetch --save git+{s}#v{s}
             \\
         , .{ framework_url, framework_version });
@@ -815,7 +816,7 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
         std.debug.print(
             \\
             \\Tencent SCF notes:
-            \\  - Deploy with `yaan deploy tencent --region ap-guangzhou` or `sh deploy.tencent.sh`.
+            \\  - Deploy with `yaan deploy tencent --region ap-guangzhou` or `bash ./deploy.tencent.sh`.
             \\  - Ships the static single binary as an HTTP "web function" — no container
             \\    registry needed; scf_bootstrap launches it on :9000 and SCF terminates TLS.
             \\  - A first-time account needs an SCF role (default SCF_QcsRole) and
@@ -828,7 +829,7 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
         std.debug.print(
             \\
             \\Alibaba Function Compute notes:
-            \\  - Deploy with `yaan deploy alibaba --region ap-southeast-1` or `sh deploy.alibaba.sh`.
+            \\  - Deploy with `yaan deploy alibaba --region ap-southeast-1` or `bash ./deploy.alibaba.sh`.
             \\  - Ships the static single binary as an FC 3.0 custom-runtime HTTP function —
             \\    no container registry; `bootstrap` launches it on :9000 and FC terminates TLS.
             \\  - The code zip is uploaded to OSS (auto-created bucket `yaan-fc-<accountid>`),
@@ -842,7 +843,7 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
         std.debug.print(
             \\
             \\Azure Functions notes:
-            \\  - Deploy with `yaan deploy azure --region eastus` or `sh deploy.azure.sh`.
+            \\  - Deploy with `yaan deploy azure --region eastus` or `bash ./deploy.azure.sh`.
             \\  - Ships the static single binary as a Functions custom handler — no container
             \\    registry; `bootstrap` launches it on $FUNCTIONS_CUSTOMHANDLER_PORT and Azure
             \\    terminates TLS. The binary is zip-deployed; a resource group + storage
@@ -854,6 +855,110 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
     }
 }
 
+const WorkflowTarget = enum {
+    all,
+    cloudrun,
+    azure,
+    tencent,
+    alibaba,
+};
+
+fn parseWorkflowTarget(target: []const u8) !WorkflowTarget {
+    if (target.len == 0 or std.mem.eql(u8, target, "all")) return .all;
+    if (std.mem.eql(u8, target, "cloudrun") or std.mem.eql(u8, target, "gcp")) return .cloudrun;
+    if (std.mem.eql(u8, target, "azure")) return .azure;
+    if (std.mem.eql(u8, target, "tencent") or std.mem.eql(u8, target, "scf")) return .tencent;
+    if (std.mem.eql(u8, target, "alibaba") or std.mem.eql(u8, target, "aliyun") or std.mem.eql(u8, target, "fc")) return .alibaba;
+    return error.UnknownAddTarget;
+}
+
+fn workflowIncludes(target: WorkflowTarget, candidate: WorkflowTarget) bool {
+    return target == .all or target == candidate;
+}
+
+fn workflowTargetName(target: WorkflowTarget) []const u8 {
+    return switch (target) {
+        .all => "all",
+        .cloudrun => "cloudrun",
+        .azure => "azure",
+        .tencent => "tencent",
+        .alibaba => "alibaba",
+    };
+}
+
+/// Writes GitHub Actions workflows for the production-grade Yaan deployment
+/// flow. Existing files are left untouched, matching `yaan add <target>`.
+pub fn addWorkflowFiles(io: std.Io, allocator: std.mem.Allocator, target_text: []const u8, framework_url: []const u8, framework_version: []const u8) !void {
+    const target = try parseWorkflowTarget(target_text);
+    const cwd = std.Io.Dir.cwd();
+
+    try writeDeployFileIfAbsent(io, cwd, ".github/workflows/yaan-ci.yml", github_ci_workflow_template);
+    const doc = try productionWorkflowDoc(allocator, framework_url, framework_version);
+    defer allocator.free(doc);
+    try writeDeployFileIfAbsent(io, cwd, "docs/production-workflow.md", doc);
+
+    if (workflowIncludes(target, .cloudrun)) {
+        try writeDeployFileIfAbsent(io, cwd, "Dockerfile", cloudrun_dockerfile_template);
+        try writeDeployFileIfAbsent(io, cwd, ".gcloudignore", gcloudignore_template);
+        try writeDeployFileIfAbsent(io, cwd, "deploy.sh", cloudrun_deploy_sh_template);
+        try writeDeployFileIfAbsent(io, cwd, ".github/workflows/yaan-deploy-cloudrun.yml", cloudrun_workflow_template);
+    }
+    if (workflowIncludes(target, .azure)) {
+        // The workflow generator uses provider-specific launchers so Azure and
+        // Alibaba can coexist in one repository. Single-target generation still
+        // writes top-level bootstrap to match the existing deploy helper.
+        if (target == .azure) try writeDeployFileIfAbsent(io, cwd, "bootstrap", azure_bootstrap_template);
+        try writeDeployFileIfAbsent(io, cwd, "bootstrap.azure", azure_bootstrap_template);
+        try writeDeployFileIfAbsent(io, cwd, "host.json", azure_host_json_template);
+        try writeDeployFileIfAbsent(io, cwd, "deploy.azure.sh", azure_deploy_sh_template);
+        try writeDeployFileIfAbsent(io, cwd, ".github/workflows/yaan-deploy-azure.yml", azure_workflow_template);
+    }
+    if (workflowIncludes(target, .tencent)) {
+        try writeDeployFileIfAbsent(io, cwd, "scf_bootstrap", tencent_scf_bootstrap_template);
+        try writeDeployFileIfAbsent(io, cwd, "deploy.tencent.sh", tencent_deploy_sh_template);
+        try writeDeployFileIfAbsent(io, cwd, ".github/workflows/yaan-deploy-tencent.yml", tencent_workflow_template);
+    }
+    if (workflowIncludes(target, .alibaba)) {
+        // See the Azure note above. `deploy.alibaba.sh` prefers bootstrap.alibaba
+        // when present, then falls back to the historical top-level bootstrap.
+        if (target == .alibaba) try writeDeployFileIfAbsent(io, cwd, "bootstrap", alibaba_bootstrap_template);
+        try writeDeployFileIfAbsent(io, cwd, "bootstrap.alibaba", alibaba_bootstrap_template);
+        try writeDeployFileIfAbsent(io, cwd, "deploy.alibaba.sh", alibaba_deploy_sh_template);
+        try writeDeployFileIfAbsent(io, cwd, ".github/workflows/yaan-deploy-alibaba.yml", alibaba_workflow_template);
+    }
+
+    try warnWorkflowDependencyPreflight(io, allocator, framework_url, framework_version);
+
+    std.debug.print(
+        \\
+        \\Production workflow notes:
+        \\  - Generated GitHub Actions workflow target: {s}.
+        \\  - Configure GitHub environments `staging` and `production`.
+        \\  - Set the matching `YAAN_*_ENABLED=true` variable before deploys run.
+        \\  - See docs/production-workflow.md for required vars, secrets, and OIDC setup.
+        \\
+    , .{workflowTargetName(target)});
+}
+
+fn warnWorkflowDependencyPreflight(io: std.Io, allocator: std.mem.Allocator, framework_url: []const u8, framework_version: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const data = cwd.readFileAlloc(io, "build.zig.zon", allocator, .limited(64 * 1024)) catch return;
+    defer allocator.free(data);
+
+    const outside_path = try cloudBuildUnreachableYaanPath(allocator, data);
+    if (outside_path) |dep_path| {
+        defer allocator.free(dep_path);
+        std.debug.print(
+            \\
+            \\warning: this app's `yaan` dependency uses a local `.path` outside the
+            \\app directory ({s}). GitHub Actions cannot see that path. Before
+            \\enabling workflow deploys, depend on the published framework instead:
+            \\  zig fetch --save git+{s}#v{s}
+            \\
+        , .{ dep_path, framework_url, framework_version });
+    }
+}
+
 fn writeDeployFileIfAbsent(io: std.Io, cwd: std.Io.Dir, path: []const u8, data: []const u8) !void {
     if (cwd.access(io, path, .{})) |_| {
         std.debug.print("{s} exists; leaving it untouched\n", .{path});
@@ -862,9 +967,480 @@ fn writeDeployFileIfAbsent(io: std.Io, cwd: std.Io.Dir, path: []const u8, data: 
         error.FileNotFound => {},
         else => return err,
     }
+    if (parentPath(path)) |parent| try cwd.createDirPath(io, parent);
     try cwd.writeFile(io, .{ .sub_path = path, .data = data });
     std.debug.print("wrote {s}\n", .{path});
 }
+
+const github_ci_workflow_template =
+    \\name: Yaan CI
+    \\
+    \\on:
+    \\  pull_request:
+    \\  push:
+    \\    branches: [main]
+    \\
+    \\permissions:
+    \\  contents: read
+    \\
+    \\jobs:
+    \\  checks:
+    \\    name: Checks
+    \\    runs-on: ubuntu-latest
+    \\    steps:
+    \\      - uses: actions/checkout@v4
+    \\
+    \\      - uses: mlugg/setup-zig@v2
+    \\        with:
+    \\          version: 0.16.0
+    \\
+    \\      - name: Build
+    \\        run: zig build
+    \\
+    \\      - name: Test
+    \\        run: zig build test
+    \\
+    \\      - name: Check
+    \\        run: zig build check
+    \\
+    \\      - name: Prove deploy artifact builds
+    \\        run: zig build -Doptimize=ReleaseFast
+    \\
+;
+
+const cloudrun_workflow_template =
+    \\name: Yaan Deploy Cloud Run
+    \\
+    \\on:
+    \\  push:
+    \\    branches: [main]
+    \\  workflow_dispatch:
+    \\    inputs:
+    \\      environment:
+    \\        description: GitHub environment to deploy
+    \\        type: choice
+    \\        required: true
+    \\        default: production
+    \\        options:
+    \\          - production
+    \\
+    \\permissions:
+    \\  contents: read
+    \\  id-token: write
+    \\
+    \\jobs:
+    \\  gate:
+    \\    name: Enable Gate
+    \\    runs-on: ubuntu-latest
+    \\    outputs:
+    \\      enabled: ${{ steps.enabled.outputs.enabled }}
+    \\    steps:
+    \\      - name: Check Cloud Run workflow is enabled
+    \\        id: enabled
+    \\        shell: bash
+    \\        run: |
+    \\          if [ "${{ vars.YAAN_CLOUDRUN_ENABLED }}" != "true" ]; then
+    \\            echo "YAAN_CLOUDRUN_ENABLED is not true; skipping Cloud Run deploy."
+    \\            echo "enabled=false" >> "$GITHUB_OUTPUT"
+    \\            exit 0
+    \\          fi
+    \\          echo "enabled=true" >> "$GITHUB_OUTPUT"
+    \\
+    \\  deploy:
+    \\    name: Deploy Cloud Run
+    \\    needs: gate
+    \\    if: needs.gate.outputs.enabled == 'true'
+    \\    runs-on: ubuntu-latest
+    \\    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\    concurrency:
+    \\      group: yaan-cloudrun-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\      cancel-in-progress: false
+    \\    steps:
+    \\      - uses: actions/checkout@v4
+    \\
+    \\      - uses: mlugg/setup-zig@v2
+    \\        with:
+    \\          version: 0.16.0
+    \\
+    \\      - uses: google-github-actions/auth@v3
+    \\        with:
+    \\          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+    \\          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+    \\
+    \\      - uses: google-github-actions/setup-gcloud@v3
+    \\
+    \\      - name: Deploy
+    \\        shell: bash
+    \\        env:
+    \\          SERVICE: ${{ vars.YAAN_CLOUDRUN_SERVICE || 'yaan-app' }}
+    \\          REGION: ${{ vars.YAAN_CLOUDRUN_REGION || 'us-central1' }}
+    \\          PROJECT: ${{ vars.YAAN_CLOUDRUN_PROJECT }}
+    \\          YAAN_SET_ENV_VARS: ${{ vars.YAAN_SET_ENV_VARS }}
+    \\        run: |
+    \\          args=()
+    \\          if [ -n "${YAAN_SET_ENV_VARS:-}" ]; then
+    \\            args+=(--set-env-vars "$YAAN_SET_ENV_VARS")
+    \\          fi
+    \\          bash ./deploy.sh "${args[@]}"
+    \\
+;
+
+const azure_workflow_template =
+    \\name: Yaan Deploy Azure Functions
+    \\
+    \\on:
+    \\  push:
+    \\    branches: [main]
+    \\  workflow_dispatch:
+    \\    inputs:
+    \\      environment:
+    \\        description: GitHub environment to deploy
+    \\        type: choice
+    \\        required: true
+    \\        default: production
+    \\        options:
+    \\          - production
+    \\
+    \\permissions:
+    \\  contents: read
+    \\  id-token: write
+    \\
+    \\jobs:
+    \\  gate:
+    \\    name: Enable Gate
+    \\    runs-on: ubuntu-latest
+    \\    outputs:
+    \\      enabled: ${{ steps.enabled.outputs.enabled }}
+    \\    steps:
+    \\      - name: Check Azure workflow is enabled
+    \\        id: enabled
+    \\        shell: bash
+    \\        run: |
+    \\          if [ "${{ vars.YAAN_AZURE_ENABLED }}" != "true" ]; then
+    \\            echo "YAAN_AZURE_ENABLED is not true; skipping Azure deploy."
+    \\            echo "enabled=false" >> "$GITHUB_OUTPUT"
+    \\            exit 0
+    \\          fi
+    \\          echo "enabled=true" >> "$GITHUB_OUTPUT"
+    \\
+    \\  deploy:
+    \\    name: Deploy Azure Functions
+    \\    needs: gate
+    \\    if: needs.gate.outputs.enabled == 'true'
+    \\    runs-on: ubuntu-latest
+    \\    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\    concurrency:
+    \\      group: yaan-azure-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\      cancel-in-progress: false
+    \\    steps:
+    \\      - uses: actions/checkout@v4
+    \\
+    \\      - uses: mlugg/setup-zig@v2
+    \\        with:
+    \\          version: 0.16.0
+    \\
+    \\      - uses: azure/login@v2
+    \\        with:
+    \\          client-id: ${{ vars.AZURE_CLIENT_ID }}
+    \\          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+    \\          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    \\
+    \\      - name: Deploy
+    \\        shell: bash
+    \\        env:
+    \\          FUNCTION: ${{ vars.YAAN_AZURE_FUNCTION }}
+    \\          REGION: ${{ vars.YAAN_AZURE_REGION || 'eastus' }}
+    \\          RESOURCE_GROUP: ${{ vars.YAAN_AZURE_RESOURCE_GROUP || 'yaan-rg' }}
+    \\          STORAGE_ACCOUNT: ${{ vars.YAAN_AZURE_STORAGE_ACCOUNT }}
+    \\          SET_ENV_VARS: ${{ vars.YAAN_SET_ENV_VARS }}
+    \\        run: bash ./deploy.azure.sh
+    \\
+;
+
+const tencent_workflow_template =
+    \\name: Yaan Deploy Tencent SCF
+    \\
+    \\on:
+    \\  push:
+    \\    branches: [main]
+    \\  workflow_dispatch:
+    \\    inputs:
+    \\      environment:
+    \\        description: GitHub environment to deploy
+    \\        type: choice
+    \\        required: true
+    \\        default: production
+    \\        options:
+    \\          - production
+    \\
+    \\permissions:
+    \\  contents: read
+    \\
+    \\jobs:
+    \\  gate:
+    \\    name: Enable Gate
+    \\    runs-on: ubuntu-latest
+    \\    outputs:
+    \\      enabled: ${{ steps.enabled.outputs.enabled }}
+    \\    steps:
+    \\      - name: Check Tencent workflow is enabled
+    \\        id: enabled
+    \\        shell: bash
+    \\        run: |
+    \\          if [ "${{ vars.YAAN_TENCENT_ENABLED }}" != "true" ]; then
+    \\            echo "YAAN_TENCENT_ENABLED is not true; skipping Tencent deploy."
+    \\            echo "enabled=false" >> "$GITHUB_OUTPUT"
+    \\            exit 0
+    \\          fi
+    \\          echo "enabled=true" >> "$GITHUB_OUTPUT"
+    \\
+    \\  deploy:
+    \\    name: Deploy Tencent SCF
+    \\    needs: gate
+    \\    if: needs.gate.outputs.enabled == 'true'
+    \\    runs-on: ubuntu-latest
+    \\    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\    concurrency:
+    \\      group: yaan-tencent-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\      cancel-in-progress: false
+    \\    steps:
+    \\      - uses: actions/checkout@v4
+    \\
+    \\      - uses: mlugg/setup-zig@v2
+    \\        with:
+    \\          version: 0.16.0
+    \\
+    \\      - uses: actions/setup-python@v5
+    \\        with:
+    \\          python-version: '3.x'
+    \\
+    \\      - name: Install Tencent Cloud CLI
+    \\        run: python -m pip install --upgrade pip tccli
+    \\
+    \\      - name: Deploy
+    \\        shell: bash
+    \\        env:
+    \\          TENCENTCLOUD_SECRET_ID: ${{ secrets.TENCENTCLOUD_SECRET_ID }}
+    \\          TENCENTCLOUD_SECRET_KEY: ${{ secrets.TENCENTCLOUD_SECRET_KEY }}
+    \\          TENCENTCLOUD_REGION: ${{ vars.YAAN_TENCENT_REGION || 'ap-guangzhou' }}
+    \\          FUNCTION: ${{ vars.YAAN_TENCENT_FUNCTION || 'yaan-app' }}
+    \\          REGION: ${{ vars.YAAN_TENCENT_REGION || 'ap-guangzhou' }}
+    \\          NAMESPACE: ${{ vars.YAAN_TENCENT_NAMESPACE || 'default' }}
+    \\          MEMORY: ${{ vars.YAAN_TENCENT_MEMORY || '256' }}
+    \\          ROLE: ${{ vars.YAAN_TENCENT_ROLE || 'SCF_QcsRole' }}
+    \\          SET_ENV_VARS: ${{ vars.YAAN_SET_ENV_VARS }}
+    \\        run: bash ./deploy.tencent.sh
+    \\
+;
+
+const alibaba_workflow_template =
+    \\name: Yaan Deploy Alibaba Function Compute
+    \\
+    \\on:
+    \\  push:
+    \\    branches: [main]
+    \\  workflow_dispatch:
+    \\    inputs:
+    \\      environment:
+    \\        description: GitHub environment to deploy
+    \\        type: choice
+    \\        required: true
+    \\        default: production
+    \\        options:
+    \\          - production
+    \\
+    \\permissions:
+    \\  contents: read
+    \\  id-token: write
+    \\
+    \\jobs:
+    \\  gate:
+    \\    name: Enable Gate
+    \\    runs-on: ubuntu-latest
+    \\    outputs:
+    \\      enabled: ${{ steps.enabled.outputs.enabled }}
+    \\    steps:
+    \\      - name: Check Alibaba workflow is enabled
+    \\        id: enabled
+    \\        shell: bash
+    \\        run: |
+    \\          if [ "${{ vars.YAAN_ALIBABA_ENABLED }}" != "true" ]; then
+    \\            echo "YAAN_ALIBABA_ENABLED is not true; skipping Alibaba deploy."
+    \\            echo "enabled=false" >> "$GITHUB_OUTPUT"
+    \\            exit 0
+    \\          fi
+    \\          echo "enabled=true" >> "$GITHUB_OUTPUT"
+    \\
+    \\  deploy:
+    \\    name: Deploy Alibaba Function Compute
+    \\    needs: gate
+    \\    if: needs.gate.outputs.enabled == 'true'
+    \\    runs-on: ubuntu-latest
+    \\    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\    concurrency:
+    \\      group: yaan-alibaba-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}
+    \\      cancel-in-progress: false
+    \\    steps:
+    \\      - uses: actions/checkout@v4
+    \\
+    \\      - uses: mlugg/setup-zig@v2
+    \\        with:
+    \\          version: 0.16.0
+    \\
+    \\      - uses: aliyun/configure-aliyun-credentials-action@v1
+    \\        with:
+    \\          oidc-provider-arn: ${{ vars.ALIBABA_OIDC_PROVIDER_ARN }}
+    \\          role-to-assume: ${{ vars.ALIBABA_ROLE_ARN }}
+    \\          role-session-name: github-actions-yaan
+    \\          role-session-expiration: 1800
+    \\          audience: ${{ vars.ALIBABA_OIDC_AUDIENCE || 'github-actions' }}
+    \\
+    \\      - name: Install Alibaba Cloud CLI
+    \\        shell: bash
+    \\        run: |
+    \\          /bin/bash -c "$(curl -fsSL https://aliyuncli.alicdn.com/install.sh)"
+    \\          aliyun version
+    \\
+    \\      - name: Deploy
+    \\        shell: bash
+    \\        env:
+    \\          FUNCTION: ${{ vars.YAAN_ALIBABA_FUNCTION || 'yaan-app' }}
+    \\          REGION: ${{ vars.YAAN_ALIBABA_REGION || 'ap-southeast-1' }}
+    \\          MEMORY: ${{ vars.YAAN_ALIBABA_MEMORY || '512' }}
+    \\          CPU: ${{ vars.YAAN_ALIBABA_CPU || '0.35' }}
+    \\          DISK: ${{ vars.YAAN_ALIBABA_DISK || '512' }}
+    \\          OSS_BUCKET: ${{ vars.YAAN_ALIBABA_OSS_BUCKET }}
+    \\          ROLE: ${{ vars.YAAN_ALIBABA_ROLE }}
+    \\          SET_ENV_VARS: ${{ vars.YAAN_SET_ENV_VARS }}
+    \\        run: bash ./deploy.alibaba.sh
+    \\
+;
+
+fn productionWorkflowDoc(allocator: std.mem.Allocator, framework_url: []const u8, framework_version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, production_workflow_doc_template, .{ framework_url, framework_version });
+}
+
+const production_workflow_doc_template =
+    \\# Production Workflow
+    \\
+    \\Generated by `yaan add workflow`.
+    \\
+    \\## Generate Or Regenerate
+    \\
+    \\```sh
+    \\yaan add workflow                 # all current deploy targets
+    \\yaan add workflow cloudrun        # only Cloud Run
+    \\yaan add workflow azure           # only Azure Functions
+    \\yaan add workflow tencent         # only Tencent SCF
+    \\yaan add workflow alibaba         # only Alibaba Function Compute
+    \\```
+    \\
+    \\Existing files are left untouched. Edit the generated files as needed, then rerun the command later without losing local changes.
+    \\
+    \\Generated shared files:
+    \\- `.github/workflows/yaan-ci.yml`
+    \\- `.github/workflows/yaan-deploy-<target>.yml`
+    \\- `docs/production-workflow.md`
+    \\
+    \\Generated target helpers:
+    \\- Cloud Run: `Dockerfile`, `.gcloudignore`, `deploy.sh`
+    \\- Azure Functions: `bootstrap`, `bootstrap.azure`, `host.json`, `deploy.azure.sh` for single-target generation; `bootstrap.azure`, `host.json`, `deploy.azure.sh` for all-target generation
+    \\- Tencent SCF: `scf_bootstrap`, `deploy.tencent.sh`
+    \\- Alibaba Function Compute: `bootstrap`, `bootstrap.alibaba`, `deploy.alibaba.sh` for single-target generation; `bootstrap.alibaba`, `deploy.alibaba.sh` for all-target generation
+    \\
+    \\## Flow
+    \\
+    \\- Pull requests run `zig build`, `zig build test`, `zig build check`, and `zig build -Doptimize=ReleaseFast`.
+    \\- Pushes to `main` deploy to the GitHub `staging` environment.
+    \\- Production deploys are manual `workflow_dispatch` runs and use the GitHub `production` environment.
+    \\- PR preview deployments are intentionally not automatic in this version, to avoid surprise cloud cost.
+    \\- Disabled deploy targets exit successfully before entering `staging` or `production`.
+    \\
+    \\## GitHub Setup
+    \\
+    \\Create two GitHub environments named `staging` and `production`. Add required reviewers or wait timers to `production` if your GitHub plan supports those protection rules.
+    \\
+    \\Each deploy workflow is gated by a variable. Leave it unset while you are wiring credentials; set it to `true` when that target is ready.
+    \\
+    \\| Target | Enable variable |
+    \\| --- | --- |
+    \\| Cloud Run | `YAAN_CLOUDRUN_ENABLED=true` |
+    \\| Azure Functions | `YAAN_AZURE_ENABLED=true` |
+    \\| Tencent SCF | `YAAN_TENCENT_ENABLED=true` |
+    \\| Alibaba Function Compute | `YAAN_ALIBABA_ENABLED=true` |
+    \\
+    \\Provider service names, regions, resource groups, and runtime app settings can be repository variables or environment-scoped variables. Use environment-scoped values when staging and production differ.
+    \\
+    \\Runtime app config still belongs in the provider environment, not in the build artifact. The generated deploy scripts accept comma-delimited `YAAN_SET_ENV_VARS` / `SET_ENV_VARS` values such as `DATABASE_URL=...`, but provider secret managers are a better place for sensitive values where supported.
+    \\
+    \\## Cloud Run
+    \\
+    \\Cloud Run uses GitHub OIDC with `google-github-actions/auth`, then deploys through `bash ./deploy.sh`.
+    \\
+    \\Required variables:
+    \\- `GCP_WORKLOAD_IDENTITY_PROVIDER`
+    \\- `GCP_SERVICE_ACCOUNT`
+    \\- `YAAN_CLOUDRUN_PROJECT`
+    \\- `YAAN_CLOUDRUN_REGION` (defaults to `us-central1`)
+    \\- `YAAN_CLOUDRUN_SERVICE` (defaults to `yaan-app`)
+    \\
+    \\## Azure Functions
+    \\
+    \\Azure uses GitHub OIDC with `azure/login`, then deploys through `bash ./deploy.azure.sh`.
+    \\
+    \\Required variables:
+    \\- `AZURE_CLIENT_ID`
+    \\- `AZURE_TENANT_ID`
+    \\- `AZURE_SUBSCRIPTION_ID`
+    \\- `YAAN_AZURE_REGION` (defaults to `eastus`)
+    \\- `YAAN_AZURE_RESOURCE_GROUP` (defaults to `yaan-rg`)
+    \\- `YAAN_AZURE_FUNCTION` (optional; script derives a stable default)
+    \\- `YAAN_AZURE_STORAGE_ACCOUNT` (optional; script derives a stable default)
+    \\
+    \\Single-target Azure generation writes both `bootstrap` and `bootstrap.azure`. All-target generation writes `bootstrap.azure` so Azure and Alibaba can coexist. The deploy script prefers `bootstrap.azure` and falls back to top-level `bootstrap` for older apps.
+    \\
+    \\## Tencent SCF
+    \\
+    \\Tencent uses documented CLI environment secrets until there is a trusted first-party OIDC path for GitHub Actions.
+    \\
+    \\Required secrets:
+    \\- `TENCENTCLOUD_SECRET_ID`
+    \\- `TENCENTCLOUD_SECRET_KEY`
+    \\
+    \\Useful variables:
+    \\- `YAAN_TENCENT_REGION` (defaults to `ap-guangzhou`)
+    \\- `YAAN_TENCENT_FUNCTION` (defaults to `yaan-app`)
+    \\- `YAAN_TENCENT_NAMESPACE` (defaults to `default`)
+    \\- `YAAN_TENCENT_MEMORY` (defaults to `256`)
+    \\- `YAAN_TENCENT_ROLE` (defaults to `SCF_QcsRole`)
+    \\
+    \\## Alibaba Function Compute
+    \\
+    \\Alibaba uses GitHub OIDC with `aliyun/configure-aliyun-credentials-action`, installs the Alibaba Cloud CLI, then deploys through `bash ./deploy.alibaba.sh`.
+    \\
+    \\Required variables:
+    \\- `ALIBABA_OIDC_PROVIDER_ARN`
+    \\- `ALIBABA_ROLE_ARN`
+    \\- `ALIBABA_OIDC_AUDIENCE` (defaults to `github-actions`)
+    \\- `YAAN_ALIBABA_REGION` (defaults to `ap-southeast-1`)
+    \\- `YAAN_ALIBABA_FUNCTION` (defaults to `yaan-app`)
+    \\- `YAAN_ALIBABA_OSS_BUCKET` (optional; script derives a bucket)
+    \\- `YAAN_ALIBABA_ROLE` (optional Function Compute execution role)
+    \\- `YAAN_ALIBABA_MEMORY`, `YAAN_ALIBABA_CPU`, `YAAN_ALIBABA_DISK` (optional sizing)
+    \\
+    \\Single-target Alibaba generation writes both `bootstrap` and `bootstrap.alibaba`. All-target generation writes `bootstrap.alibaba` so Alibaba and Azure can coexist. The deploy script prefers `bootstrap.alibaba` and falls back to top-level `bootstrap` for older apps.
+    \\
+    \\## Framework Dependency
+    \\
+    \\GitHub Actions can only see files checked into this app repository. URL dependencies and vendored local paths inside the app directory are fine. A `.dependencies.yaan.path` that points outside the app works locally but will not exist in Actions or remote builders.
+    \\
+    \\If you see the generated warning, switch to the published framework dependency:
+    \\
+    \\```sh
+    \\zig fetch --save git+{s}#v{s}
+    \\```
+    \\
+;
 
 const dockerfile_template =
     \\# Generated by `yaan add docker`. Builds the in-process single-binary
@@ -944,9 +1520,9 @@ const cloudrun_dockerfile_template =
     \\# Cloud Run's $PORT.
     \\#
     \\# NOTE: `gcloud run deploy --source` builds in Cloud Build, whose context is
-    \\# this directory. Your `yaan` dependency must be reachable from here (a
-    \\# published url+hash dep, or vendored) — a local `.path` dep outside this dir
-    \\# is not visible to Cloud Build.
+    \\# this directory. Your `yaan` dependency must be reachable from here: use a
+    \\# published url+hash dep, or a local `.path` vendored inside this directory.
+    \\# A `.path` outside this dir is not visible to Cloud Build.
     \\
     \\FROM ziglang/zig:0.16.0 AS build
     \\WORKDIR /app
@@ -978,9 +1554,9 @@ const cloudrun_deploy_sh_template =
     \\#!/usr/bin/env bash
     \\# Generated by `yaan add cloudrun`. Deploy this app to Google Cloud Run via
     \\# Cloud Build (builds the Dockerfile from source). Override with env vars:
-    \\#   SERVICE=my-svc REGION=us-central1 PROJECT=my-proj sh deploy.sh
+    \\#   SERVICE=my-svc REGION=us-central1 PROJECT=my-proj bash ./deploy.sh
     \\# Extra `gcloud run deploy` flags pass through, e.g.:
-    \\#   sh deploy.sh --set-env-vars DATABASE_URL=... --no-allow-unauthenticated
+    \\#   bash ./deploy.sh --set-env-vars DATABASE_URL=... --no-allow-unauthenticated
     \\set -euo pipefail
     \\
     \\SERVICE="${SERVICE:-yaan-app}"
@@ -1016,9 +1592,11 @@ const tencent_deploy_sh_template =
     \\#
     \\# Override with env vars (all optional):
     \\#   FUNCTION=my-fn REGION=ap-guangzhou NAMESPACE=default MEMORY=256 \
-    \\#   ROLE=SCF_QcsRole SET_ENV_VARS="K=V,K2=V2" sh deploy.tencent.sh
+    \\#   ROLE=SCF_QcsRole SET_ENV_VARS="K=V,K2=V2" bash ./deploy.tencent.sh
+    \\# SET_ENV_VARS is comma-delimited simple KEY=VALUE pairs. Commas cannot be
+    \\# embedded in values; quote the whole assignment in your shell as needed.
     \\# Preview the steps without building or mutating anything:
-    \\#   DRY_RUN=1 sh deploy.tencent.sh
+    \\#   DRY_RUN=1 bash ./deploy.tencent.sh
     \\set -euo pipefail
     \\
     \\FUNCTION="${FUNCTION:-yaan-app}"
@@ -1034,9 +1612,20 @@ const tencent_deploy_sh_template =
     \\SET_ENV_VARS="${SET_ENV_VARS:-}"
     \\DRY_RUN="${DRY_RUN:-}"
     \\
-    \\command -v tccli >/dev/null 2>&1 || { echo "error: tccli not found. Install the Tencent Cloud CLI and run \`tccli configure\`."; exit 1; }
+    \\if [ -z "$DRY_RUN" ]; then
+    \\  command -v tccli >/dev/null 2>&1 || { echo "error: tccli not found. Install the Tencent Cloud CLI and run \`tccli configure\`."; exit 1; }
+    \\fi
     \\
     \\run() { echo "+ $*"; if [ -z "$DRY_RUN" ]; then "$@"; fi; }
+    \\json_escape() {
+    \\  local s="$1"
+    \\  s="${s//\\/\\\\}"
+    \\  s="${s//\"/\\\"}"
+    \\  s="${s//$'\n'/\\n}"
+    \\  s="${s//$'\r'/\\r}"
+    \\  s="${s//$'\t'/\\t}"
+    \\  printf '%s' "$s"
+    \\}
     \\
     \\# 1. Build the static single binary (dist/ embedded; no toolchain at runtime).
     \\run zig build -Doptimize=ReleaseFast -Dtarget="$TARGET"
@@ -1067,7 +1656,13 @@ const tencent_deploy_sh_template =
     \\  items=""
     \\  IFS=',' read -ra _pairs <<< "$SET_ENV_VARS"
     \\  for _p in "${_pairs[@]}"; do
-    \\    items="${items:+$items,}{\"Key\":\"${_p%%=*}\",\"Value\":\"${_p#*=}\"}"
+    \\    [[ "$_p" == *=* ]] || { echo "error: SET_ENV_VARS must be comma-separated KEY=VALUE pairs"; exit 1; }
+    \\    key="${_p%%=*}"
+    \\    value="${_p#*=}"
+    \\    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "error: invalid env var name '$key'"; exit 1; }
+    \\    key="$(json_escape "$key")"
+    \\    value="$(json_escape "$value")"
+    \\    items="${items:+$items,}{\"Key\":\"$key\",\"Value\":\"$value\"}"
     \\  done
     \\  ENV_JSON=",\"Environment\":{\"Variables\":[$items]}"
     \\fi
@@ -1144,9 +1739,11 @@ const alibaba_deploy_sh_template =
     \\#
     \\# Override with env vars (all optional):
     \\#   FUNCTION=my-fn REGION=ap-southeast-1 MEMORY=512 CPU=0.35 OSS_BUCKET=my-bucket \
-    \\#   ROLE=acs:ram::123:role/fc-role SET_ENV_VARS="K=V,K2=V2" sh deploy.alibaba.sh
+    \\#   ROLE=acs:ram::123:role/fc-role SET_ENV_VARS="K=V,K2=V2" bash ./deploy.alibaba.sh
+    \\# SET_ENV_VARS is comma-delimited simple KEY=VALUE pairs. Commas cannot be
+    \\# embedded in values; quote the whole assignment in your shell as needed.
     \\# Preview the steps without building or mutating anything:
-    \\#   DRY_RUN=1 sh deploy.alibaba.sh
+    \\#   DRY_RUN=1 bash ./deploy.alibaba.sh
     \\set -euo pipefail
     \\
     \\FUNCTION="${FUNCTION:-yaan-app}"
@@ -1162,9 +1759,20 @@ const alibaba_deploy_sh_template =
     \\ROLE="${ROLE:-}"
     \\DRY_RUN="${DRY_RUN:-}"
     \\
-    \\command -v aliyun >/dev/null 2>&1 || { echo "error: aliyun CLI not found. Install it and run \`aliyun configure\`."; exit 1; }
+    \\if [ -z "$DRY_RUN" ]; then
+    \\  command -v aliyun >/dev/null 2>&1 || { echo "error: aliyun CLI not found. Install it and run \`aliyun configure\`."; exit 1; }
+    \\fi
     \\
     \\run() { echo "+ $*"; if [ -z "$DRY_RUN" ]; then "$@"; fi; }
+    \\json_escape() {
+    \\  local s="$1"
+    \\  s="${s//\\/\\\\}"
+    \\  s="${s//\"/\\\"}"
+    \\  s="${s//$'\n'/\\n}"
+    \\  s="${s//$'\r'/\\r}"
+    \\  s="${s//$'\t'/\\t}"
+    \\  printf '%s' "$s"
+    \\}
     \\
     \\# 1. Build the static single binary (dist/ embedded; no toolchain at runtime).
     \\run zig build -Doptimize=ReleaseFast -Dtarget="$TARGET"
@@ -1178,7 +1786,9 @@ const alibaba_deploy_sh_template =
     \\trap 'rm -rf "$STAGE"' EXIT
     \\if [ -z "$DRY_RUN" ]; then
     \\  cp "$BIN" "$STAGE/yaan-app"
-    \\  if [ -f bootstrap ]; then
+    \\  if [ -f bootstrap.alibaba ]; then
+    \\    cp bootstrap.alibaba "$STAGE/bootstrap"
+    \\  elif [ -f bootstrap ]; then
     \\    cp bootstrap "$STAGE/bootstrap"
     \\  else
     \\    printf '#!/bin/bash\nexec ./yaan-app --host 0.0.0.0 --port 9000 --trust-forwarded\n' > "$STAGE/bootstrap"
@@ -1208,7 +1818,15 @@ const alibaba_deploy_sh_template =
     \\if [ -n "$SET_ENV_VARS" ]; then
     \\  pairs=""
     \\  IFS=',' read -ra _kv <<< "$SET_ENV_VARS"
-    \\  for _p in "${_kv[@]}"; do pairs="${pairs:+$pairs,}\"${_p%%=*}\":\"${_p#*=}\""; done
+    \\  for _p in "${_kv[@]}"; do
+    \\    [[ "$_p" == *=* ]] || { echo "error: SET_ENV_VARS must be comma-separated KEY=VALUE pairs"; exit 1; }
+    \\    key="${_p%%=*}"
+    \\    value="${_p#*=}"
+    \\    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "error: invalid env var name '$key'"; exit 1; }
+    \\    key="$(json_escape "$key")"
+    \\    value="$(json_escape "$value")"
+    \\    pairs="${pairs:+$pairs,}\"$key\":\"$value\""
+    \\  done
     \\  ENV_JSON=",\"environmentVariables\":{$pairs}"
     \\fi
     \\ROLE_JSON=""
@@ -1283,9 +1901,11 @@ const azure_deploy_sh_template =
     \\# Override with env vars (all optional). Names default to globally-unique values
     \\# derived from your subscription id:
     \\#   FUNCTION=my-app RESOURCE_GROUP=my-rg REGION=eastus STORAGE_ACCOUNT=mystg \
-    \\#   SET_ENV_VARS="K=V,K2=V2" sh deploy.azure.sh
+    \\#   SET_ENV_VARS="K=V,K2=V2" bash ./deploy.azure.sh
+    \\# SET_ENV_VARS is comma-delimited simple KEY=VALUE pairs. Commas cannot be
+    \\# embedded in values; quote the whole assignment in your shell as needed.
     \\# Preview the steps without building or mutating anything:
-    \\#   DRY_RUN=1 sh deploy.azure.sh
+    \\#   DRY_RUN=1 bash ./deploy.azure.sh
     \\set -euo pipefail
     \\
     \\REGION="${REGION:-eastus}"
@@ -1294,7 +1914,9 @@ const azure_deploy_sh_template =
     \\SET_ENV_VARS="${SET_ENV_VARS:-}"
     \\DRY_RUN="${DRY_RUN:-}"
     \\
-    \\command -v az >/dev/null 2>&1 || { echo "error: az CLI not found. Install the Azure CLI and run \`az login\`."; exit 1; }
+    \\if [ -z "$DRY_RUN" ]; then
+    \\  command -v az >/dev/null 2>&1 || { echo "error: az CLI not found. Install the Azure CLI and run \`az login\`."; exit 1; }
+    \\fi
     \\
     \\run() { echo "+ $*"; if [ -z "$DRY_RUN" ]; then "$@"; fi; }
     \\
@@ -1329,9 +1951,17 @@ const azure_deploy_sh_template =
     \\# 3. App settings: disable the Oryx build (we ship a built binary, not source —
     \\#    otherwise the zip deploy fails with "Could not detect runtime"), plus any
     \\#    app env vars (Yaan reads env.private from the process environment).
-    \\SETTINGS="SCM_DO_BUILD_DURING_DEPLOYMENT=false ENABLE_ORYX_BUILD=false"
-    \\[ -n "$SET_ENV_VARS" ] && SETTINGS="$SETTINGS $(printf '%s' "$SET_ENV_VARS" | tr ',' ' ')"
-    \\run az functionapp config appsettings set -n "$FUNCTION" -g "$RESOURCE_GROUP" --settings $SETTINGS -o none
+    \\settings=(SCM_DO_BUILD_DURING_DEPLOYMENT=false ENABLE_ORYX_BUILD=false)
+    \\if [ -n "$SET_ENV_VARS" ]; then
+    \\  IFS=',' read -ra _pairs <<< "$SET_ENV_VARS"
+    \\  for _p in "${_pairs[@]}"; do
+    \\    [[ "$_p" == *=* ]] || { echo "error: SET_ENV_VARS must be comma-separated KEY=VALUE pairs"; exit 1; }
+    \\    key="${_p%%=*}"
+    \\    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "error: invalid env var name '$key'"; exit 1; }
+    \\    settings+=("$_p")
+    \\  done
+    \\fi
+    \\run az functionapp config appsettings set -n "$FUNCTION" -g "$RESOURCE_GROUP" --settings "${settings[@]}" -o none
     \\
     \\# 4. Stage the package: host.json + bootstrap + binary + a catch-all HTTP
     \\#    function, all at the zip root (http/ holds the function).
@@ -1340,7 +1970,9 @@ const azure_deploy_sh_template =
     \\if [ -z "$DRY_RUN" ]; then
     \\  mkdir -p "$STAGE/http"
     \\  cp "$BIN" "$STAGE/yaan-app"
-    \\  if [ -f bootstrap ]; then
+    \\  if [ -f bootstrap.azure ]; then
+    \\    cp bootstrap.azure "$STAGE/bootstrap"
+    \\  elif [ -f bootstrap ]; then
     \\    cp bootstrap "$STAGE/bootstrap"
     \\  else
     \\    printf '#!/bin/sh\nexec ./yaan-app --host 0.0.0.0 --port "${FUNCTIONS_CUSTOMHANDLER_PORT:-8080}" --trust-forwarded\n' > "$STAGE/bootstrap"
@@ -1391,11 +2023,11 @@ pub const CloudRunDeploy = struct {
     set_env_vars: ?[]const u8,
     dry_run: bool,
     /// Baked framework coordinates, used to print the fix command when the app
-    /// uses a local `.path` dependency Cloud Build cannot reach.
+    /// uses a local `.path` dependency outside Cloud Build's source context.
     framework_url: []const u8,
     framework_version: []const u8,
-    /// Skip the local-path-dependency preflight (e.g. when the framework is
-    /// vendored into the build context).
+    /// Skip the local-path-dependency preflight when the `yaan` dependency is
+    /// reachable from the build context despite using `.path`.
     skip_dep_check: bool,
 };
 
@@ -1403,8 +2035,8 @@ pub const CloudRunDeploy = struct {
 /// --source .` (Cloud Build builds the Dockerfile, pushes to Artifact Registry,
 /// and deploys). Streams gcloud's output live. `dry_run` prints the command
 /// without running it. The app's `yaan` dependency must be reachable inside
-/// Cloud Build's context (published url+hash dep, or vendored) — a local `.path`
-/// dep outside this directory is not uploaded.
+/// Cloud Build's context (published url+hash dep, or `.path` vendored inside
+/// this directory) — a local `.path` dep outside this directory is not uploaded.
 pub fn deployCloudRun(io: std.Io, allocator: std.mem.Allocator, opts: CloudRunDeploy) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -1414,9 +2046,9 @@ pub fn deployCloudRun(io: std.Io, allocator: std.mem.Allocator, opts: CloudRunDe
     try argv.append(allocator, if (opts.allow_unauthenticated) "--allow-unauthenticated" else "--no-allow-unauthenticated");
     if (opts.set_env_vars) |e| try argv.appendSlice(allocator, &.{ "--set-env-vars", e });
 
-    // Preflight (real deploys only): a local `.path` framework dependency isn't
-    // uploaded to Cloud Build, so `--source` would fail to resolve it. Catch it
-    // before printing/spawning instead of after the (slow) build.
+    // Preflight (real deploys only): a `yaan` `.path` outside the source context
+    // is not uploaded to Cloud Build, so `--source` would fail to resolve it.
+    // Catch it before printing/spawning instead of after the (slow) build.
     if (!opts.dry_run and !opts.skip_dep_check) try checkCloudBuildReachable(io, allocator, opts.framework_url, opts.framework_version);
 
     // Print the exact command for transparency.
@@ -1443,28 +2075,85 @@ pub fn deployCloudRun(io: std.Io, allocator: std.mem.Allocator, opts: CloudRunDe
     }
 }
 
-/// Errors if the app's `yaan` dependency is a local `.path` (Cloud Build can't
-/// reach it). A `git+` URL dependency is reachable. Missing/unreadable
+const BuildZonYaanDependency = struct {
+    path: ?[]const u8 = null,
+};
+
+const BuildZonDependencies = struct {
+    yaan: ?BuildZonYaanDependency = null,
+};
+
+const BuildZonManifest = struct {
+    dependencies: BuildZonDependencies = .{},
+};
+
+/// Errors if the app's `yaan` dependency is a local `.path` outside this app
+/// directory (Cloud Build can't reach it). URL dependencies and vendored local
+/// paths inside the build context are reachable. Missing/unreadable/unparseable
 /// build.zig.zon does not block (a vendored or unusual setup may be fine).
 fn checkCloudBuildReachable(io: std.Io, allocator: std.mem.Allocator, framework_url: []const u8, framework_version: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, "build.zig.zon", allocator, .limited(64 * 1024)) catch return;
     defer allocator.free(data);
-    // A git URL dependency is fetched by Cloud Build — reachable.
-    if (std.mem.indexOf(u8, data, "git+") != null) return;
-    // The dependency path field is `.path = "..."`; the package's own top-level
-    // `.paths = .{` does not match this needle, so it is not a false positive.
-    if (std.mem.indexOf(u8, data, ".path = \"") != null) {
+
+    const outside_path = try cloudBuildUnreachableYaanPath(allocator, data);
+    if (outside_path) |dep_path| {
+        defer allocator.free(dep_path);
         std.debug.print(
-            \\error: this app uses a local `.path` framework dependency, which Cloud
-            \\Build cannot reach (its build context is this directory). Depend on the
-            \\published framework first:
+            \\error: this app's `yaan` dependency uses a local `.path` outside the
+            \\app directory ({s}), which Cloud Build cannot reach. Depend on the
+            \\published framework instead:
             \\  zig fetch --save git+{s}#v{s}
             \\then re-run, or pass --skip-dep-check to deploy anyway.
             \\
-        , .{ framework_url, framework_version });
+        , .{ dep_path, framework_url, framework_version });
         return error.LocalPathDependency;
     }
+}
+
+fn cloudBuildUnreachableYaanPath(allocator: std.mem.Allocator, zon: []const u8) !?[]u8 {
+    const dep_path = try localYaanDependencyPath(allocator, zon) orelse return null;
+    errdefer allocator.free(dep_path);
+    if (cloudBuildCanReachLocalPath(dep_path)) {
+        allocator.free(dep_path);
+        return null;
+    }
+    return dep_path;
+}
+
+fn localYaanDependencyPath(allocator: std.mem.Allocator, zon: []const u8) !?[]u8 {
+    const source = try allocator.dupeZ(u8, zon);
+    defer allocator.free(source);
+
+    const parsed = std.zon.parse.fromSliceAlloc(BuildZonManifest, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+        .free_on_error = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ParseZon => return null,
+    };
+    defer std.zon.parse.free(allocator, parsed);
+
+    const dep = parsed.dependencies.yaan orelse return null;
+    const path = dep.path orelse return null;
+    return try allocator.dupe(u8, path);
+}
+
+fn cloudBuildCanReachLocalPath(path: []const u8) bool {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
+
+    var depth: usize = 0;
+    var parts = std.mem.tokenizeScalar(u8, path, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            if (depth == 0) return false;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    return true;
 }
 
 pub const TencentScfDeploy = struct {
@@ -1501,7 +2190,7 @@ pub fn deployTencentScf(io: std.Io, allocator: std.mem.Allocator, opts: TencentS
         break :blk ".yaan/deploy.tencent.sh";
     };
 
-    // `env KEY=VALUE ... sh <script>` sets the script's config without touching
+    // `env KEY=VALUE ... bash <script>` sets the script's config without touching
     // the inherited environment. Only provided options are exported; the script
     // supplies defaults for the rest.
     var argv: std.ArrayList([]const u8) = .empty;
@@ -1514,13 +2203,13 @@ pub fn deployTencentScf(io: std.Io, allocator: std.mem.Allocator, opts: TencentS
     if (opts.memory) |m| try argv.append(allocator, try std.fmt.allocPrint(allocator, "MEMORY={s}", .{m}));
     if (opts.set_env_vars) |e| try argv.append(allocator, try std.fmt.allocPrint(allocator, "SET_ENV_VARS={s}", .{e}));
     if (opts.dry_run) try argv.append(allocator, "DRY_RUN=1");
-    try argv.append(allocator, "sh");
+    try argv.append(allocator, "bash");
     try argv.append(allocator, script_path);
 
     std.debug.print("running {s}\n", .{script_path});
     var child = std.process.spawn(io, .{ .argv = argv.items }) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("a POSIX shell (`env`/`sh`) is required for Tencent deploys.\n", .{});
+            std.debug.print("bash (`env`/`bash`) is required for Tencent deploys.\n", .{});
             return error.DeployFailed;
         },
         else => return err,
@@ -1577,13 +2266,13 @@ pub fn deployAlibabaFc(io: std.Io, allocator: std.mem.Allocator, opts: AlibabaFc
     if (opts.role) |r| try argv.append(allocator, try std.fmt.allocPrint(allocator, "ROLE={s}", .{r}));
     if (opts.set_env_vars) |e| try argv.append(allocator, try std.fmt.allocPrint(allocator, "SET_ENV_VARS={s}", .{e}));
     if (opts.dry_run) try argv.append(allocator, "DRY_RUN=1");
-    try argv.append(allocator, "sh");
+    try argv.append(allocator, "bash");
     try argv.append(allocator, script_path);
 
     std.debug.print("running {s}\n", .{script_path});
     var child = std.process.spawn(io, .{ .argv = argv.items }) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("a POSIX shell (`env`/`sh`) is required for Alibaba deploys.\n", .{});
+            std.debug.print("bash (`env`/`bash`) is required for Alibaba deploys.\n", .{});
             return error.DeployFailed;
         },
         else => return err,
@@ -1635,13 +2324,13 @@ pub fn deployAzureFunctions(io: std.Io, allocator: std.mem.Allocator, opts: Azur
     if (opts.storage_account) |s| try argv.append(allocator, try std.fmt.allocPrint(allocator, "STORAGE_ACCOUNT={s}", .{s}));
     if (opts.set_env_vars) |e| try argv.append(allocator, try std.fmt.allocPrint(allocator, "SET_ENV_VARS={s}", .{e}));
     if (opts.dry_run) try argv.append(allocator, "DRY_RUN=1");
-    try argv.append(allocator, "sh");
+    try argv.append(allocator, "bash");
     try argv.append(allocator, script_path);
 
     std.debug.print("running {s}\n", .{script_path});
     var child = std.process.spawn(io, .{ .argv = argv.items }) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("a POSIX shell (`env`/`sh`) is required for Azure deploys.\n", .{});
+            std.debug.print("bash (`env`/`bash`) is required for Azure deploys.\n", .{});
             return error.DeployFailed;
         },
         else => return err,
@@ -4944,6 +5633,8 @@ test "tencent deploy templates carry the SCF web-function invariants" {
         "\"PublicNetStatus\":\"ENABLE\"",
         "\"EipConfig\":{\"EipStatus\":\"DISABLE\"}",
         "--cli-input-json \"file://",
+        "json_escape()",
+        "[ -z \"$DRY_RUN\" ]; then",
         "tccli scf CreateFunction",
         "tccli scf UpdateFunctionCode",
     }) |needle| {
@@ -4967,6 +5658,8 @@ test "alibaba deploy templates carry the FC 3.0 custom-runtime invariants" {
         "\"customRuntimeConfig\":{\"command\":[\"./bootstrap\"],\"port\":9000}",
         "ossBucketName",
         "aliyun oss cp",
+        "json_escape()",
+        "[ -z \"$DRY_RUN\" ]; then",
         "aliyun fc POST \"/2023-03-30/functions\"",
         "\"triggerType\":\"http\"",
         "\\\"authType\\\":\\\"anonymous\\\"",
@@ -4992,6 +5685,9 @@ test "azure deploy templates carry the Functions custom-handler invariants" {
     inline for (.{
         "--os-type Linux --runtime custom --functions-version 4",
         "SCM_DO_BUILD_DURING_DEPLOYMENT=false ENABLE_ORYX_BUILD=false",
+        "settings=(",
+        "\"${settings[@]}\"",
+        "[ -z \"$DRY_RUN\" ]; then",
         "\"route\": \"{*path}\"",
         "\"authLevel\": \"anonymous\"",
         "az functionapp deployment source config-zip",
@@ -4999,6 +5695,190 @@ test "azure deploy templates carry the Functions custom-handler invariants" {
     }) |needle| {
         try std.testing.expect(contains(u8, azure_deploy_sh_template, 1, needle));
     }
+}
+
+test "workflow target parser accepts supported targets and aliases" {
+    try std.testing.expectEqual(WorkflowTarget.all, try parseWorkflowTarget(""));
+    try std.testing.expectEqual(WorkflowTarget.all, try parseWorkflowTarget("all"));
+    try std.testing.expectEqual(WorkflowTarget.cloudrun, try parseWorkflowTarget("cloudrun"));
+    try std.testing.expectEqual(WorkflowTarget.cloudrun, try parseWorkflowTarget("gcp"));
+    try std.testing.expectEqual(WorkflowTarget.azure, try parseWorkflowTarget("azure"));
+    try std.testing.expectEqual(WorkflowTarget.tencent, try parseWorkflowTarget("tencent"));
+    try std.testing.expectEqual(WorkflowTarget.tencent, try parseWorkflowTarget("scf"));
+    try std.testing.expectEqual(WorkflowTarget.alibaba, try parseWorkflowTarget("alibaba"));
+    try std.testing.expectEqual(WorkflowTarget.alibaba, try parseWorkflowTarget("aliyun"));
+    try std.testing.expectError(error.UnknownAddTarget, parseWorkflowTarget("vercel"));
+}
+
+test "workflow templates carry the production deployment contract" {
+    const contains = std.mem.containsAtLeast;
+    inline for (.{
+        "pull_request:",
+        "branches: [main]",
+        "version: 0.16.0",
+        "zig build",
+        "zig build test",
+        "zig build check",
+        "zig build -Doptimize=ReleaseFast",
+    }) |needle| {
+        try std.testing.expect(contains(u8, github_ci_workflow_template, 1, needle));
+    }
+
+    inline for (.{
+        "workflow_dispatch:",
+        "environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'staging' }}",
+        "concurrency:",
+        "needs.gate.outputs.enabled == 'true'",
+        "id-token: write",
+        "YAAN_CLOUDRUN_ENABLED",
+        "google-github-actions/auth@v3",
+        "google-github-actions/setup-gcloud@v3",
+        "bash ./deploy.sh",
+    }) |needle| {
+        try std.testing.expect(contains(u8, cloudrun_workflow_template, 1, needle));
+    }
+
+    inline for (.{
+        "YAAN_AZURE_ENABLED",
+        "azure/login@v2",
+        "AZURE_CLIENT_ID",
+        "bash ./deploy.azure.sh",
+    }) |needle| {
+        try std.testing.expect(contains(u8, azure_workflow_template, 1, needle));
+    }
+
+    inline for (.{
+        "YAAN_TENCENT_ENABLED",
+        "actions/setup-python@v5",
+        "TENCENTCLOUD_SECRET_ID",
+        "python -m pip install --upgrade pip tccli",
+        "bash ./deploy.tencent.sh",
+    }) |needle| {
+        try std.testing.expect(contains(u8, tencent_workflow_template, 1, needle));
+    }
+
+    inline for (.{
+        "YAAN_ALIBABA_ENABLED",
+        "aliyun/configure-aliyun-credentials-action@v1",
+        "oidc-provider-arn",
+        "aliyuncli.alicdn.com/install.sh",
+        "bash ./deploy.alibaba.sh",
+    }) |needle| {
+        try std.testing.expect(contains(u8, alibaba_workflow_template, 1, needle));
+    }
+}
+
+test "workflow all writes workflows docs helpers and preserves existing files" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "build.zig.zon", .data =
+        \\.{
+        \\    .dependencies = .{
+        \\        .yaan = .{ .url = "git+https://github.com/bytebrujo/yaan#v0.1.0", .hash = "1220" },
+        \\    },
+        \\}
+    });
+
+    var orig = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer orig.close(io);
+    const tmp_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(tmp_path);
+    try std.Io.Threaded.chdir(tmp_path);
+    defer std.Io.Threaded.fchdir(orig.handle) catch {};
+
+    try addWorkflowFiles(io, a, "all", "https://github.com/bytebrujo/yaan", "0.1.0");
+
+    const cwd = std.Io.Dir.cwd();
+    inline for (.{
+        ".github/workflows/yaan-ci.yml",
+        ".github/workflows/yaan-deploy-cloudrun.yml",
+        ".github/workflows/yaan-deploy-azure.yml",
+        ".github/workflows/yaan-deploy-tencent.yml",
+        ".github/workflows/yaan-deploy-alibaba.yml",
+        "docs/production-workflow.md",
+        "Dockerfile",
+        ".gcloudignore",
+        "deploy.sh",
+        "bootstrap.azure",
+        "host.json",
+        "deploy.azure.sh",
+        "scf_bootstrap",
+        "deploy.tencent.sh",
+        "bootstrap.alibaba",
+        "deploy.alibaba.sh",
+    }) |path| {
+        const exists = if (cwd.access(io, path, .{})) true else |_| false;
+        try std.testing.expect(exists);
+    }
+
+    const shared_bootstrap_exists = if (cwd.access(io, "bootstrap", .{})) true else |_| false;
+    try std.testing.expect(!shared_bootstrap_exists);
+
+    try cwd.writeFile(io, .{ .sub_path = ".github/workflows/yaan-ci.yml", .data = "custom workflow\n" });
+    try addWorkflowFiles(io, a, "all", "https://github.com/bytebrujo/yaan", "0.1.0");
+    const ci = try cwd.readFileAlloc(io, ".github/workflows/yaan-ci.yml", a, .limited(1024));
+    defer a.free(ci);
+    try std.testing.expectEqualStrings("custom workflow\n", ci);
+}
+
+test "cloud build preflight ignores unrelated local dependencies" {
+    const zon =
+        \\.{
+        \\    .foo = .{ .yaan = .{ .path = "../not-a-dependency" } },
+        \\    .dependencies = .{
+        \\        .other = .{ .path = "../local-only" },
+        \\        .yaan = .{ .url = "git+https://github.com/bytebrujo/yaan#v0.1.0", .hash = "1220" },
+        \\    },
+        \\}
+    ;
+    const dep_path = try cloudBuildUnreachableYaanPath(std.testing.allocator, zon);
+    try std.testing.expect(dep_path == null);
+}
+
+test "cloud build preflight allows vendored yaan dependency inside context" {
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        .yaan = .{ .path = "vendor/yaan" },
+        \\    },
+        \\}
+    ;
+    const dep_path = try cloudBuildUnreachableYaanPath(std.testing.allocator, zon);
+    try std.testing.expect(dep_path == null);
+}
+
+test "cloud build preflight rejects yaan dependency outside context" {
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        .yaan = .{
+        \\            // local dev dependency created by yaan init
+        \\            .path = "../..",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const dep_path = (try cloudBuildUnreachableYaanPath(std.testing.allocator, zon)).?;
+    defer std.testing.allocator.free(dep_path);
+    try std.testing.expectEqualStrings("../..", dep_path);
+}
+
+test "cloud build preflight unrelated url does not mask local yaan path" {
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        .foo = .{ .url = "git+https://example.com/foo#main", .hash = "1220" },
+        \\        .yaan = .{ .path = "../yaan" },
+        \\    },
+        \\    .paths = .{ "build.zig", "src" },
+        \\}
+    ;
+    const dep_path = (try cloudBuildUnreachableYaanPath(std.testing.allocator, zon)).?;
+    defer std.testing.allocator.free(dep_path);
+    try std.testing.expectEqualStrings("../yaan", dep_path);
 }
 
 test "collectParseDiagnostics locates parser errors under E_PARSE" {

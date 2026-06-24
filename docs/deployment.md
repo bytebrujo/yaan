@@ -104,6 +104,91 @@ docker run -e YAAN_COOKIE_SECRET=… -e DATABASE_URL=… -p 8080:8080 myapp
 
 The image is just the binary — no OS packages, no runtime, no source.
 
+## Built-in GitHub production workflow
+
+Yaan apps can opt into a complete GitHub Actions workflow:
+
+```sh
+yaan add workflow                 # CI plus deploy workflows for all targets
+yaan add workflow cloudrun        # only Cloud Run
+yaan add workflow azure           # only Azure Functions
+yaan add workflow tencent         # only Tencent SCF
+yaan add workflow alibaba         # only Alibaba Function Compute
+```
+
+`yaan add workflow` defaults to `all`. Like the other `yaan add` commands, it
+leaves existing files untouched so you can customize the generated workflows and
+rerun the command later without losing edits.
+
+The generated flow is deliberately boring and production-oriented:
+
+- Pull requests run `zig build`, `zig build test`, `zig build check`, and
+  `zig build -Doptimize=ReleaseFast`. PRs do not deploy by default.
+- Pushes to `main` deploy to the GitHub `staging` environment.
+- Production deploys are manual `workflow_dispatch` runs guarded by GitHub's
+  `production` environment. Add required reviewers or wait timers there if your
+  GitHub plan supports them.
+- Each deploy workflow has a lightweight enable gate first. If the matching
+  `YAAN_*_ENABLED` variable is not set to `true`, the workflow exits
+  successfully before entering a protected environment.
+
+Generated shared files:
+
+- `.github/workflows/yaan-ci.yml`
+- `.github/workflows/yaan-deploy-cloudrun.yml`
+- `.github/workflows/yaan-deploy-azure.yml`
+- `.github/workflows/yaan-deploy-tencent.yml`
+- `.github/workflows/yaan-deploy-alibaba.yml`
+- `docs/production-workflow.md`
+
+Target helpers are generated only for the selected targets: Cloud Run gets
+`Dockerfile`, `.gcloudignore`, and `deploy.sh`; Azure gets `host.json`,
+`deploy.azure.sh`, and launchers; Tencent gets `scf_bootstrap` and
+`deploy.tencent.sh`; Alibaba gets launchers and `deploy.alibaba.sh`.
+
+The required enable variables are:
+
+| Target | Enable variable |
+|---|---|
+| Cloud Run | `YAAN_CLOUDRUN_ENABLED=true` |
+| Azure Functions | `YAAN_AZURE_ENABLED=true` |
+| Tencent SCF | `YAAN_TENCENT_ENABLED=true` |
+| Alibaba Function Compute | `YAAN_ALIBABA_ENABLED=true` |
+
+Provider authentication follows the platform's recommended GitHub Actions path
+where there is a trusted first-party option:
+
+- Cloud Run uses GitHub OIDC through `google-github-actions/auth` and then
+  calls `bash ./deploy.sh`.
+- Azure uses GitHub OIDC through `azure/login` and then calls
+  `bash ./deploy.azure.sh`.
+- Alibaba uses GitHub OIDC through
+  `aliyun/configure-aliyun-credentials-action`, installs the Alibaba Cloud CLI,
+  and then calls `bash ./deploy.alibaba.sh`.
+- Tencent uses the documented `TENCENTCLOUD_SECRET_ID` and
+  `TENCENTCLOUD_SECRET_KEY` environment secrets, installs `tccli`, and then
+  calls `bash ./deploy.tencent.sh`.
+
+Put provider names, regions, resource groups, function names, and runtime app
+settings in repository variables or environment-scoped variables. Prefer
+environment-scoped values when staging and production differ. Runtime app config
+still belongs in the provider environment, not baked into the Yaan binary.
+
+`docs/production-workflow.md` is generated into the app with the provider-specific
+variable and secret checklist. It also repeats the important dependency caveat:
+GitHub Actions can only see files in the repository. A `.dependencies.yaan.path`
+inside the app is fine, and URL dependencies are fine; a `.path` pointing outside
+the app works locally but will fail in Actions or remote builders. The generator
+prints the matching `zig fetch --save git+...` command when it detects that
+setup.
+
+One detail matters when generating every target at once: Azure Functions and
+Alibaba Function Compute both package a file named `bootstrap`, but their
+launchers are different. `yaan add workflow all` writes `bootstrap.azure` and
+`bootstrap.alibaba`, and the deploy scripts prefer those provider-specific
+launchers. Single-target generation also writes the historical top-level
+`bootstrap` for compatibility.
+
 ## Google Cloud Run
 
 **For a step-by-step walkthrough, see [deploy-gcp.md](deploy-gcp.md).** The rest
@@ -123,10 +208,11 @@ yaan deploy gcp --project <id> --region us-central1 --service my-app \
 `yaan deploy gcp` shells out to `gcloud run deploy --source .`, which uses
 Cloud Build to build the Dockerfile, push to Artifact Registry, and deploy —
 streaming gcloud's output live. `--dry-run` prints the exact command without
-running it; `sh deploy.sh` is the equivalent script. Requires the Google Cloud
-SDK (`gcloud auth login`). It preflights for a local `.path` framework
-dependency (which Cloud Build can't reach, see below) and refuses early with the
-fix command — pass `--skip-dep-check` to override (e.g. when vendoring).
+running it; `bash ./deploy.sh` is the equivalent script. Requires the Google Cloud
+SDK (`gcloud auth login`). It preflights only the app's `yaan` dependency: if it
+is a `.path` outside the Cloud Build source context, Yaan refuses early with the
+fix command. A local path vendored inside the app directory is acceptable; pass
+`--skip-dep-check` if you know your build context contains the dependency.
 
 The generated Dockerfile runs the server with `--host 0.0.0.0 --trust-forwarded`
 so `--force-https`, HSTS, and secure cookies are correct behind Cloud Run's
@@ -135,11 +221,12 @@ front-end (which overwrites `X-Forwarded-*` and has no fixed IP to put in
 a directly-exposed server a client could spoof the headers.
 
 **Build-context caveat.** `--source` builds in Cloud Build, whose context is the
-app directory. Your `yaan` dependency must be reachable from there — a published
-`url`+`hash` dependency, or the framework vendored into the build context. A
-local `.path` dependency pointing *outside* the app directory (as `yaan init`
-writes for local development) is not uploaded to Cloud Build and the build will
-fail to resolve it. The fix is to depend on a **published** framework version:
+app directory. Your `yaan` dependency must be reachable from there — either as a
+published `url`+`hash` dependency or as a local `.path` that resolves inside the
+app directory. A local `.path` dependency pointing *outside* the app directory
+(as `yaan init` writes for local development) is not uploaded to Cloud Build and
+the build will fail to resolve it. The usual fix is to depend on a **published**
+framework version:
 
 ```sh
 zig fetch --save git+https://github.com/bytebrujo/yaan#v0.1.0
@@ -171,9 +258,12 @@ a resource group + storage account + function app exist (Functions requires a
 storage account; both auto-created), disables the server-side Oryx build, zips
 `host.json` + a `bootstrap` launcher + the binary + a catch-all HTTP function,
 and zip-deploys via `az`, then prints `https://<app>.azurewebsites.net`.
-`--dry-run` prints the steps without building or mutating; `sh deploy.azure.sh`
+`--dry-run` prints the steps without building or mutating; `bash ./deploy.azure.sh`
 is the equivalent script (settings via `FUNCTION`/`REGION`/`RESOURCE_GROUP`/
 `STORAGE_ACCOUNT`/`SET_ENV_VARS` env vars). Requires the Azure CLI (`az login`).
+Use `--set-env-vars`/`SET_ENV_VARS` for simple comma-separated `KEY=VALUE` pairs
+only; quote spaces, quotes, and backslashes for your shell, and configure comma
+or multiline values as Azure app settings or Key Vault references after deploy.
 
 `bootstrap` runs the server with `--host 0.0.0.0 --port
 "$FUNCTIONS_CUSTOMHANDLER_PORT" --trust-forwarded`: Azure proxies HTTP to that
@@ -214,10 +304,13 @@ yaan deploy tencent --region ap-guangzhou --function my-app \
 `yaan deploy tencent` runs `deploy.tencent.sh`: it builds the static binary,
 zips it with an `scf_bootstrap` launcher, then creates the web function (or
 updates its code if it exists) via `tccli`, waits for `Active`, and prints the
-URL. `--dry-run` prints the steps without building or mutating; `sh
-deploy.tencent.sh` is the equivalent script (settings via `FUNCTION`/`REGION`/
+URL. `--dry-run` prints the steps without building or mutating; `bash
+./deploy.tencent.sh` is the equivalent script (settings via `FUNCTION`/`REGION`/
 `MEMORY`/`SET_ENV_VARS`/… env vars). Requires the Tencent Cloud CLI
 (`tccli configure`).
+Use `--set-env-vars`/`SET_ENV_VARS` for simple comma-separated `KEY=VALUE` pairs
+only; quote spaces, quotes, and backslashes for your shell, and configure comma
+or multiline values as encrypted SCF env vars or secrets after deploy.
 
 `scf_bootstrap` runs the server with `--host 0.0.0.0 --port 9000
 --trust-forwarded`: SCF proxies HTTP to `:9000` and overwrites `X-Forwarded-*`,
@@ -255,10 +348,14 @@ yaan deploy alibaba --region ap-southeast-1 --function my-app \
 it with a `bootstrap` launcher, uploads the zip to **OSS** (FC reads code from
 there — the `aliyun` CLI can't inline a multi-MB zip past `ARG_MAX`), then
 creates the FC function (or updates its code) and an anonymous HTTP trigger, and
-prints the URL. `--dry-run` prints the steps without building or mutating; `sh
-deploy.alibaba.sh` is the equivalent script (settings via `FUNCTION`/`REGION`/
+prints the URL. `--dry-run` prints the steps without building or mutating; `bash
+./deploy.alibaba.sh` is the equivalent script (settings via `FUNCTION`/`REGION`/
 `MEMORY`/`CPU`/`OSS_BUCKET`/`SET_ENV_VARS`/… env vars). Requires the Alibaba
 Cloud CLI (`aliyun configure`).
+Use `--set-env-vars`/`SET_ENV_VARS` for simple comma-separated `KEY=VALUE` pairs
+only; quote spaces, quotes, and backslashes for your shell, and configure comma
+or multiline values as Function Compute environment variables or KMS secrets
+after deploy.
 
 `bootstrap` runs the server with `--host 0.0.0.0 --port 9000 --trust-forwarded`:
 FC proxies HTTP to `:9000` and forwards `X-Forwarded-*`, so `--force-https`,

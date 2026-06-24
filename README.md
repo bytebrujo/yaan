@@ -39,14 +39,23 @@ YAAN_COOKIE_SECRET=… ./zig-out/bin/yaan-app --host 0.0.0.0 --port 8080
 
 It handles requests concurrently, serves `GET /healthz`, and drains in-flight
 requests on SIGTERM. `yaan add docker` / `systemd` / `cloudrun` / `azure` emit
-deployment files, and one command ships the single binary to a managed target —
-no container registry:
+deployment files, and `yaan add workflow` emits the default GitHub production
+workflow: PR checks, staging deploys from `main`, and manual production deploys
+guarded by GitHub's `production` environment. One command ships the single
+binary to a managed target — no container registry:
 
 - **[Google Cloud Run](docs/deploy-gcp.md)** — `yaan deploy gcp` (via `gcloud`).
 - **[Azure Functions](docs/deploy-azure.md)** — `yaan deploy azure` (via `az`).
 - 🚧 *Coming soon:* **[Tencent Cloud SCF](docs/deploy-tencent.md)**
   (`yaan deploy tencent`) and **[Alibaba Function Compute](docs/deploy-alibaba.md)**
   (`yaan deploy alibaba`) — implemented, pending live validation.
+
+Generate CI/CD for one or all targets with:
+
+```sh
+yaan add workflow                 # all current deploy targets
+yaan add workflow cloudrun        # or azure, tencent, alibaba
+```
 
 **Full guide: [docs/deployment.md](docs/deployment.md).**
 

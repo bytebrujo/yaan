@@ -31,19 +31,41 @@ yaan add cloudrun
 This writes a `Dockerfile` (a static binary on `scratch`), a `.gcloudignore`,
 and a `deploy.sh`. It also prints the command you need for step 2.
 
+## Automated staging/production workflow
+
+For GitHub Actions, generate the built-in production workflow instead of wiring
+CI/CD by hand:
+
+```sh
+yaan add workflow cloudrun
+```
+
+That writes `.github/workflows/yaan-ci.yml`,
+`.github/workflows/yaan-deploy-cloudrun.yml`, the Cloud Run helper files, and
+`docs/production-workflow.md`. Pull requests run checks and prove the deploy
+artifact builds; pushes to `main` deploy to the GitHub `staging` environment;
+production deploys are manual `workflow_dispatch` runs guarded by GitHub's
+`production` environment.
+
+Set `YAAN_CLOUDRUN_ENABLED=true` only after the GitHub environments and OIDC
+variables documented in `docs/production-workflow.md` are configured. Until then,
+the deploy workflow exits successfully without deploying.
+
 ## 2. Depend on a published framework version
 
-Cloud Build (which builds your image) can only fetch the framework from a
-published URL, not from a local path on your machine. Point your app at a
-released version:
+Cloud Build (which builds your image) can fetch dependencies from published URLs
+and from files copied into the source context. Yaan's preflight only checks the
+app's `yaan` dependency: a `.path` that resolves inside your app directory is
+acceptable, but a `.path` pointing outside that directory is not uploaded to
+Cloud Build. The usual fix is to point your app at a released version:
 
 ```sh
 zig fetch --save git+https://github.com/bytebrujo/yaan#v0.1.0
 ```
 
-`yaan add cloudrun` prints the exact version to use. (Skip this only if you've
-vendored the framework into your app. If no release exists yet, see
-[releasing.md](releasing.md).)
+`yaan add cloudrun` prints the exact version to use. Skip this if you've vendored
+the framework into your app so the local path stays inside the build context. If
+no release exists yet, see [releasing.md](releasing.md).
 
 ## 3. Deploy
 
@@ -108,8 +130,9 @@ Then add the DNS records `gcloud` prints.
 
 ## Troubleshooting
 
-- **"this app uses a local `.path` framework dependency"** — do step 2. Cloud
-  Build can't see a local path; you need the published URL dependency.
+- **"this app uses a local `.path` framework dependency"** — your app's `yaan`
+  dependency points outside the Cloud Build source context. Do step 2, or vendor
+  the framework into the app directory and deploy with `--skip-dep-check`.
 - **"gcloud not found"** — install the Google Cloud SDK and run `gcloud auth
   login` (prerequisites above).
 - **Build fails fetching `yaan`** — make sure the release tag in step 2 exists

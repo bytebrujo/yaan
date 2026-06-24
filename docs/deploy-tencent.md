@@ -60,6 +60,28 @@ This writes `scf_bootstrap` (the launcher — edit it to add flags like
 `--force-https`) and `deploy.tencent.sh` (the deploy pipeline). Both are
 optional: `yaan deploy tencent` works without them, using a built-in copy.
 
+## Automated staging/production workflow
+
+For GitHub Actions, generate the built-in production workflow instead of wiring
+CI/CD by hand:
+
+```sh
+yaan add workflow tencent
+```
+
+That writes `.github/workflows/yaan-ci.yml`,
+`.github/workflows/yaan-deploy-tencent.yml`, the Tencent helper files, and
+`docs/production-workflow.md`. Pull requests run checks and prove the deploy
+artifact builds; pushes to `main` deploy to the GitHub `staging` environment;
+production deploys are manual `workflow_dispatch` runs guarded by GitHub's
+`production` environment.
+
+Tencent is the secrets-based exception: configure `TENCENTCLOUD_SECRET_ID` and
+`TENCENTCLOUD_SECRET_KEY` as GitHub environment secrets. Set
+`YAAN_TENCENT_ENABLED=true` only after the GitHub environments and Tencent
+variables documented in `docs/production-workflow.md` are configured. Until then,
+the deploy workflow exits successfully without deploying.
+
 ## 2. Deploy
 
 ```sh
@@ -76,13 +98,14 @@ Preview every step without building or mutating anything:
 yaan deploy tencent --dry-run
 ```
 
-`sh deploy.tencent.sh` (after `yaan add tencent`) is the exact equivalent and
+`bash ./deploy.tencent.sh` (after `yaan add tencent`) is the exact equivalent and
 takes the same settings as environment variables
 (`FUNCTION`, `REGION`, `NAMESPACE`, `MEMORY`, `ROLE`, `SET_ENV_VARS`, `DRY_RUN`).
 
 ## Environment variables and secrets
 
-Pass runtime config with `--set-env-vars` (comma-separated `KEY=VALUE`):
+Pass runtime config with `--set-env-vars` as a comma-separated list of simple
+`KEY=VALUE` pairs:
 
 ```sh
 yaan deploy tencent --region ap-guangzhou \
@@ -91,8 +114,13 @@ yaan deploy tencent --region ap-guangzhou \
 
 Yaan reads `env.private` variables (and `YAAN_COOKIE_SECRET`) from the process
 environment at startup, so the same binary runs in any environment without a
-rebuild. For secrets, prefer SCF's encrypted env vars or
-[Secrets Manager](https://www.tencentcloud.com/products/ssm) over plaintext.
+rebuild.
+
+The generated Bash helper treats commas as separators before building the SCF
+environment JSON. Quote spaces, quotes, and backslashes for your shell;
+comma-bearing or multiline values should be set as encrypted SCF env vars after
+deploy or stored in [Secrets Manager](https://www.tencentcloud.com/products/ssm)
+instead of plaintext.
 
 ## HTTPS and cookies — nothing to configure
 

@@ -151,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
     // allocator so concurrent requests free their memory (init.arena, used for
     // startup above, never reclaims).
     try yaan.server.serve(io, std.heap.smp_allocator, .{
+        .label = "yaan",
         .host = host,
         .port = port,
         // With --assets-dir, serve that directory from disk; otherwise serve the

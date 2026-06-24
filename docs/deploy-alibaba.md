@@ -60,6 +60,26 @@ This writes `bootstrap` (the launcher — edit it to add flags like
 `--force-https`) and `deploy.alibaba.sh` (the deploy pipeline). Both are
 optional: `yaan deploy alibaba` works without them, using a built-in copy.
 
+## Automated staging/production workflow
+
+For GitHub Actions, generate the built-in production workflow instead of wiring
+CI/CD by hand:
+
+```sh
+yaan add workflow alibaba
+```
+
+That writes `.github/workflows/yaan-ci.yml`,
+`.github/workflows/yaan-deploy-alibaba.yml`, the Alibaba helper files, and
+`docs/production-workflow.md`. Pull requests run checks and prove the deploy
+artifact builds; pushes to `main` deploy to the GitHub `staging` environment;
+production deploys are manual `workflow_dispatch` runs guarded by GitHub's
+`production` environment.
+
+Set `YAAN_ALIBABA_ENABLED=true` only after the GitHub environments and Alibaba
+OIDC variables documented in `docs/production-workflow.md` are configured. Until
+then, the deploy workflow exits successfully without deploying.
+
 ## 2. Deploy
 
 ```sh
@@ -76,14 +96,15 @@ Preview every step without building or mutating anything:
 yaan deploy alibaba --dry-run
 ```
 
-`sh deploy.alibaba.sh` (after `yaan add alibaba`) is the exact equivalent and
+`bash ./deploy.alibaba.sh` (after `yaan add alibaba`) is the exact equivalent and
 takes the same settings as environment variables
 (`FUNCTION`, `REGION`, `MEMORY`, `CPU`, `OSS_BUCKET`, `ROLE`, `SET_ENV_VARS`,
 `DRY_RUN`).
 
 ## Environment variables and secrets
 
-Pass runtime config with `--set-env-vars` (comma-separated `KEY=VALUE`):
+Pass runtime config with `--set-env-vars` as a comma-separated list of simple
+`KEY=VALUE` pairs:
 
 ```sh
 yaan deploy alibaba --region ap-southeast-1 \
@@ -92,8 +113,13 @@ yaan deploy alibaba --region ap-southeast-1 \
 
 Yaan reads `env.private` variables (and `YAAN_COOKIE_SECRET`) from the process
 environment at startup, so the same binary runs in any environment without a
-rebuild. For secrets, prefer [KMS Secrets Manager](https://www.alibabacloud.com/help/en/kms)
-over plaintext env vars.
+rebuild.
+
+The generated Bash helper treats commas as separators before building the
+Function Compute environment JSON. Quote spaces, quotes, and backslashes for
+your shell; comma-bearing or multiline values should be configured after deploy
+or stored in [KMS Secrets Manager](https://www.alibabacloud.com/help/en/kms)
+instead of plaintext env vars.
 
 ## HTTPS and cookies — nothing to configure
 

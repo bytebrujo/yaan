@@ -49,6 +49,26 @@ edit it to change methods or add `--force-https` via `bootstrap`), and
 `deploy.azure.sh` (the deploy pipeline). All are optional: `yaan deploy azure`
 works without them, using built-in copies.
 
+## Automated staging/production workflow
+
+For GitHub Actions, generate the built-in production workflow instead of wiring
+CI/CD by hand:
+
+```sh
+yaan add workflow azure
+```
+
+That writes `.github/workflows/yaan-ci.yml`,
+`.github/workflows/yaan-deploy-azure.yml`, the Azure helper files, and
+`docs/production-workflow.md`. Pull requests run checks and prove the deploy
+artifact builds; pushes to `main` deploy to the GitHub `staging` environment;
+production deploys are manual `workflow_dispatch` runs guarded by GitHub's
+`production` environment.
+
+Set `YAAN_AZURE_ENABLED=true` only after the GitHub environments and Azure OIDC
+variables documented in `docs/production-workflow.md` are configured. Until then,
+the deploy workflow exits successfully without deploying.
+
 ## 2. Deploy
 
 ```sh
@@ -67,15 +87,16 @@ derived from your subscription id; override with `--function` /
 yaan deploy azure --dry-run
 ```
 
-`sh deploy.azure.sh` (after `yaan add azure`) is the exact equivalent and takes
+`bash ./deploy.azure.sh` (after `yaan add azure`) is the exact equivalent and takes
 the same settings as environment variables
 (`FUNCTION`, `REGION`, `RESOURCE_GROUP`, `STORAGE_ACCOUNT`, `SET_ENV_VARS`,
 `DRY_RUN`).
 
 ## Environment variables and secrets
 
-Pass runtime config with `--set-env-vars` (comma-separated `KEY=VALUE`) — these
-become function-app settings, which the process reads as env vars:
+Pass runtime config with `--set-env-vars` as a comma-separated list of simple
+`KEY=VALUE` pairs. These become function-app settings, which the process reads
+as env vars:
 
 ```sh
 yaan deploy azure --region eastus \
@@ -84,8 +105,12 @@ yaan deploy azure --region eastus \
 
 Yaan reads `env.private` variables (and `YAAN_COOKIE_SECRET`) from the process
 environment at startup, so the same binary runs in any environment without a
-rebuild. For secrets, prefer a [Key Vault reference](https://learn.microsoft.com/azure/app-service/app-service-key-vault-references)
-in the app setting over a plaintext value.
+rebuild.
+
+The generated Bash helper treats commas as separators. Quote spaces, quotes, and
+backslashes for your shell; comma-bearing or multiline values should be set
+directly after deploy or provided through a [Key Vault reference](https://learn.microsoft.com/azure/app-service/app-service-key-vault-references)
+instead of a plaintext value.
 
 ## HTTPS and cookies — nothing to configure
 

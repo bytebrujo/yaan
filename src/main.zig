@@ -24,13 +24,24 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (std.mem.eql(u8, cmd, "add")) {
         const target = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
-        yaan.project.addDeployFile(init.io, allocator, target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
-            error.UnknownAddTarget => {
-                std.debug.print("usage: yaan add <docker|systemd|cloudrun|tencent|alibaba|azure>\n", .{});
-                std.process.exit(1);
-            },
-            else => return err,
-        };
+        if (std.mem.eql(u8, target, "workflow")) {
+            const workflow_target = if (args.len >= 4 and !std.mem.startsWith(u8, args[3], "-")) args[3] else "all";
+            yaan.project.addWorkflowFiles(init.io, allocator, workflow_target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
+                error.UnknownAddTarget => {
+                    std.debug.print("usage: yaan add workflow [all|cloudrun|azure|tencent|alibaba]\n", .{});
+                    std.process.exit(1);
+                },
+                else => return err,
+            };
+        } else {
+            yaan.project.addDeployFile(init.io, allocator, target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
+                error.UnknownAddTarget => {
+                    std.debug.print("usage: yaan add <docker|systemd|cloudrun|tencent|alibaba|azure|workflow [all|cloudrun|azure|tencent|alibaba]>\n", .{});
+                    std.process.exit(1);
+                },
+                else => return err,
+            };
+        }
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
         if (std.mem.eql(u8, sub, "gcp") or std.mem.eql(u8, sub, "cloudrun")) {
@@ -282,7 +293,7 @@ fn usage() void {
         \\
         \\commands:
         \\  init [name]
-        \\  add <docker|systemd|cloudrun|tencent|alibaba|azure>    (emit deployment files for the single-binary artifact)
+        \\  add <docker|systemd|cloudrun|tencent|alibaba|azure|workflow [all|cloudrun|azure|tencent|alibaba]>    (emit deployment files or GitHub Actions workflows)
         \\  deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--dry-run]
         \\  deploy tencent [--function NAME] [--region R] [--memory MB] [--set-env-vars K=V,...] [--dry-run]
         \\  deploy alibaba [--function NAME] [--region R] [--memory MB] [--oss-bucket NAME] [--set-env-vars K=V,...] [--dry-run]

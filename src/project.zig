@@ -795,6 +795,20 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
         try writeDeployFileIfAbsent(io, cwd, ".dockerignore", dockerignore_template);
     } else if (std.mem.eql(u8, target, "systemd")) {
         try writeDeployFileIfAbsent(io, cwd, "yaan.service", systemd_template);
+    } else if (std.mem.eql(u8, target, "caddy")) {
+        try writeDeployFileIfAbsent(io, cwd, "Caddyfile", caddyfile_template);
+        std.debug.print(
+            \\
+            \\Caddy notes:
+            \\  - Caddy reverse-proxies public HTTPS to the Yaan binary (plain HTTP on
+            \\    127.0.0.1:8080) and provisions/renews TLS certificates automatically.
+            \\  - Install it (https://caddyserver.com/docs/install), then attach a domain:
+            \\      yaan domain add app.example.com --reload
+            \\    Each `yaan domain add` appends a reverse-proxy block to the Caddyfile.
+            \\  - Run the app with `--trusted-proxy 127.0.0.1,::1` so it trusts the
+            \\    X-Forwarded-* headers Caddy sets (correct client IP, HTTPS detection).
+            \\
+        , .{});
     } else if (std.mem.eql(u8, target, "cloudrun")) {
         try writeDeployFileIfAbsent(io, cwd, "Dockerfile", cloudrun_dockerfile_template);
         try writeDeployFileIfAbsent(io, cwd, ".gcloudignore", gcloudignore_template);
@@ -852,6 +866,201 @@ pub fn addDeployFile(io: std.Io, allocator: std.mem.Allocator, target: []const u
         , .{});
     } else {
         return error.UnknownAddTarget;
+    }
+}
+
+pub const DomainOptions = struct {
+    /// The public hostname to attach, e.g. "app.example.com".
+    host: []const u8,
+    /// Local port the Yaan binary serves on (matches the systemd unit's 8080).
+    port: []const u8 = "8080",
+    /// Caddyfile to edit; null resolves to ./Caddyfile, then /etc/caddy/Caddyfile.
+    caddyfile: ?[]const u8 = null,
+    /// Server's public IP, printed verbatim in the DNS A record; null prints a
+    /// placeholder the user fills in.
+    ip: ?[]const u8 = null,
+    /// Run `caddy reload` after editing so the change takes effect immediately.
+    reload: bool = false,
+};
+
+/// `yaan domain add <host>` — append a reverse-proxy site block to the Caddyfile
+/// (host -> 127.0.0.1:<port>) and print the DNS A record the user must create.
+/// Idempotent: an existing block for the host is left as-is. Caddy provisions the
+/// TLS certificate automatically once DNS resolves, so this writes no cert config.
+pub fn domainAdd(io: std.Io, allocator: std.mem.Allocator, opts: DomainOptions) !void {
+    const cwd = std.Io.Dir.cwd();
+    const path = opts.caddyfile orelse defaultCaddyfilePath(io, cwd);
+
+    const existing = cwd.readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    if (caddyfileHasBlock(existing, opts.host)) {
+        std.debug.print("{s} already has a block for {s}; leaving it untouched\n", .{ path, opts.host });
+    } else {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, existing);
+        // Separate from prior content with a blank line, but don't pile up blanks.
+        if (existing.len != 0 and !std.mem.endsWith(u8, existing, "\n\n")) {
+            try out.appendSlice(allocator, if (std.mem.endsWith(u8, existing, "\n")) "\n" else "\n\n");
+        }
+        try out.print(allocator, "{s} {{\n    reverse_proxy 127.0.0.1:{s}\n}}\n", .{ opts.host, opts.port });
+        if (parentPath(path)) |parent| try cwd.createDirPath(io, parent);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = out.items });
+        std.debug.print("wrote {s} block for {s} -> 127.0.0.1:{s}\n", .{ path, opts.host, opts.port });
+    }
+
+    printDnsRecord(opts.host, opts.ip);
+
+    if (opts.reload) {
+        try reloadCaddy(io, allocator, path);
+    } else {
+        std.debug.print(
+            \\
+            \\Caddy auto-provisions the TLS certificate once DNS resolves. Apply with:
+            \\  yaan domain add {s} --reload      (or: caddy reload --config {s})
+            \\
+        , .{ opts.host, path });
+    }
+}
+
+/// `yaan domain rm <host>` — remove the host's reverse-proxy block from the
+/// Caddyfile. A no-op (with a notice) if no such block exists.
+pub fn domainRemove(io: std.Io, allocator: std.mem.Allocator, opts: DomainOptions) !void {
+    const cwd = std.Io.Dir.cwd();
+    const path = opts.caddyfile orelse defaultCaddyfilePath(io, cwd);
+
+    const existing = cwd.readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("{s} not found; nothing to remove\n", .{path});
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const trimmed = try removeCaddyBlock(allocator, existing, opts.host);
+    defer allocator.free(trimmed);
+    if (trimmed.len == existing.len) {
+        std.debug.print("{s} has no block for {s}; nothing to remove\n", .{ path, opts.host });
+        return;
+    }
+    try cwd.writeFile(io, .{ .sub_path = path, .data = trimmed });
+    std.debug.print("removed {s} block from {s}\n", .{ opts.host, path });
+    if (opts.reload) try reloadCaddy(io, allocator, path);
+}
+
+/// Prefer a project-local Caddyfile; fall back to the system path if it exists;
+/// otherwise default to the project-local path (which `domainAdd` will create).
+fn defaultCaddyfilePath(io: std.Io, cwd: std.Io.Dir) []const u8 {
+    if (cwd.access(io, "Caddyfile", .{})) |_| return "Caddyfile" else |_| {}
+    if (cwd.access(io, "/etc/caddy/Caddyfile", .{})) |_| return "/etc/caddy/Caddyfile" else |_| {}
+    return "Caddyfile";
+}
+
+/// True if `content` already opens a site block whose address list names `host`
+/// (e.g. a line like `app.example.com {` or `app.example.com, www... {`).
+fn caddyfileHasBlock(content: []const u8, host: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (blockOpensForHost(line, host)) return true;
+    }
+    return false;
+}
+
+/// A site-block opener for `host`: a `{`-terminated line whose comma-separated
+/// address list contains `host` as a whole token (so "example.com" doesn't match
+/// "example.com.uk", and a commented `# host {` line is ignored).
+fn blockOpensForHost(line: []const u8, host: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0 or trimmed[0] == '#') return false;
+    if (!std.mem.endsWith(u8, trimmed, "{")) return false;
+    const addrs = std.mem.trim(u8, trimmed[0 .. trimmed.len - 1], " \t");
+    var parts = std.mem.splitScalar(u8, addrs, ',');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, std.mem.trim(u8, part, " \t"), host)) return true;
+    }
+    return false;
+}
+
+/// Return `content` with the site block for `host` removed (opener line through
+/// its matching closing `}`), plus one immediately-preceding blank line. Returns
+/// a fresh allocation; identical length to the input means nothing was removed.
+fn removeCaddyBlock(allocator: std.mem.Allocator, content: []const u8, host: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var skipping = false;
+    while (lines.next()) |line| {
+        if (skipping) {
+            // Consume through the line that closes the block.
+            if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "}")) skipping = false;
+            continue;
+        }
+        if (blockOpensForHost(line, host)) {
+            skipping = true;
+            // Drop a single blank line we just emitted to separate blocks.
+            if (std.mem.endsWith(u8, out.items, "\n\n")) _ = out.pop();
+            continue;
+        }
+        try out.appendSlice(allocator, line);
+        // splitScalar drops the delimiter; restore it except past the final line.
+        if (lines.index != null) try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Print the DNS A record the user must create at their registrar. `Name` is a
+/// best-effort label relative to the likely zone apex (registrable domain); the
+/// note covers apex and deeper-subdomain cases.
+fn printDnsRecord(host: []const u8, ip: ?[]const u8) void {
+    std.debug.print(
+        \\
+        \\Add this DNS record at your registrar:
+        \\  Type   A
+        \\  Name   {s}          (use @ for the zone apex)
+        \\  Value  {s}
+        \\  TTL    300
+        \\
+    , .{ dnsRecordName(host), ip orelse "<your server's public IP>" });
+}
+
+/// Best-effort DNS record name: the labels left of the registrable domain
+/// (assumed to be the last two labels). "example.com" -> "@", "app.example.com"
+/// -> "app", "a.b.example.com" -> "a.b". Heuristic — multi-part public suffixes
+/// (e.g. co.uk) need the user to adjust against their actual zone.
+fn dnsRecordName(host: []const u8) []const u8 {
+    var last_dot: ?usize = null;
+    var second_last_dot: ?usize = null;
+    for (host, 0..) |c, i| {
+        if (c == '.') {
+            second_last_dot = last_dot;
+            last_dot = i;
+        }
+    }
+    return if (second_last_dot) |idx| host[0..idx] else "@";
+}
+
+/// Run `caddy reload --config <path>`. A missing `caddy` binary is a soft
+/// failure: the Caddyfile edit already succeeded, so we warn rather than abort.
+fn reloadCaddy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+    _ = allocator;
+    const argv = [_][]const u8{ "caddy", "reload", "--config", path };
+    std.debug.print("running caddy reload --config {s}\n", .{path});
+    var child = std.process.spawn(io, .{ .argv = &argv }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("caddy not found on PATH; edit saved, reload manually with `caddy reload --config {s}`\n", .{path});
+            return;
+        },
+        else => return err,
+    };
+    const term = child.wait(io) catch return error.DeployFailed;
+    switch (term) {
+        .exited => |code| if (code != 0) return error.DeployFailed,
+        else => return error.DeployFailed,
     }
 }
 
@@ -1509,6 +1718,27 @@ const systemd_template =
     \\
     \\[Install]
     \\WantedBy=multi-user.target
+    \\
+;
+
+const caddyfile_template =
+    \\# Generated by `yaan add caddy`. Caddy reverse-proxies public HTTPS to the
+    \\# Yaan single-binary artifact (which serves plain HTTP on 127.0.0.1:8080) and
+    \\# provisions/renews TLS certificates automatically.
+    \\#
+    \\# Install Caddy (https://caddyserver.com/docs/install), then:
+    \\#   sudo cp Caddyfile /etc/caddy/Caddyfile
+    \\#   sudo systemctl reload caddy
+    \\#
+    \\# Attach a domain (appends a block like the commented example below):
+    \\#   yaan domain add app.example.com --reload
+    \\#
+    \\# Run the app with `--trusted-proxy 127.0.0.1,::1` so it trusts the
+    \\# X-Forwarded-* headers Caddy sets (client IP, HTTPS detection).
+    \\
+    \\# app.example.com {
+    \\#     reverse_proxy 127.0.0.1:8080
+    \\# }
     \\
 ;
 
@@ -5607,6 +5837,45 @@ fn joinPath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
     if (a.len == 0) return allocator.dupe(u8, b);
     if (a[a.len - 1] == '/') return std.fmt.allocPrint(allocator, "{s}{s}", .{ a, b });
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ a, b });
+}
+
+test "caddyfile site-block detection matches whole address tokens" {
+    // A real opener for the host matches; a longer host or a comment does not.
+    try std.testing.expect(blockOpensForHost("app.example.com {", "app.example.com"));
+    try std.testing.expect(blockOpensForHost("  app.example.com, www.example.com {", "www.example.com"));
+    try std.testing.expect(!blockOpensForHost("app.example.com.uk {", "app.example.com"));
+    try std.testing.expect(!blockOpensForHost("# app.example.com {", "app.example.com"));
+    try std.testing.expect(!blockOpensForHost("    reverse_proxy 127.0.0.1:8080", "app.example.com"));
+
+    const file = "app.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n";
+    try std.testing.expect(caddyfileHasBlock(file, "app.example.com"));
+    try std.testing.expect(!caddyfileHasBlock(file, "other.example.com"));
+}
+
+test "dnsRecordName picks the label left of the registrable domain" {
+    try std.testing.expectEqualStrings("@", dnsRecordName("example.com"));
+    try std.testing.expectEqualStrings("app", dnsRecordName("app.example.com"));
+    try std.testing.expectEqualStrings("a.b", dnsRecordName("a.b.example.com"));
+    try std.testing.expectEqualStrings("@", dnsRecordName("localhost"));
+}
+
+test "removeCaddyBlock drops the host block and its separator, leaving the rest" {
+    const a = std.testing.allocator;
+    const file =
+        "one.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n" ++
+        "\napp.example.com {\n    reverse_proxy 127.0.0.1:9000\n}\n";
+
+    const after = try removeCaddyBlock(a, file, "app.example.com");
+    defer a.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "app.example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "one.example.com") != null);
+    // The block we kept is byte-for-byte intact (separator blank line collapsed).
+    try std.testing.expectEqualStrings("one.example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n", after);
+
+    // Removing an absent host returns an identical-length copy (no-op signal).
+    const noop = try removeCaddyBlock(a, file, "missing.example.com");
+    defer a.free(noop);
+    try std.testing.expectEqual(file.len, noop.len);
 }
 
 test "check source fails malformed input" {

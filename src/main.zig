@@ -36,12 +36,37 @@ pub fn main(init: std.process.Init) !void {
         } else {
             yaan.project.addDeployFile(init.io, allocator, target, build_options.framework_url, build_options.framework_version) catch |err| switch (err) {
                 error.UnknownAddTarget => {
-                    std.debug.print("usage: yaan add <docker|systemd|cloudrun|tencent|alibaba|azure|workflow [all|cloudrun|azure|tencent|alibaba]>\n", .{});
+                    std.debug.print("usage: yaan add <docker|systemd|caddy|cloudrun|tencent|alibaba|azure|workflow [all|cloudrun|azure|tencent|alibaba]>\n", .{});
                     std.process.exit(1);
                 },
                 else => return err,
             };
         }
+    } else if (std.mem.eql(u8, cmd, "domain")) {
+        const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
+        const host = if (args.len >= 4 and !std.mem.startsWith(u8, args[3], "-")) args[3] else "";
+        const is_add = std.mem.eql(u8, sub, "add");
+        const is_rm = std.mem.eql(u8, sub, "rm") or std.mem.eql(u8, sub, "remove");
+        if ((!is_add and !is_rm) or host.len == 0) {
+            std.debug.print("usage: yaan domain <add|rm> <host> [--port 8080] [--caddyfile PATH] [--ip ADDR] [--reload]\n", .{});
+            std.process.exit(1);
+        }
+        const domain_opts: yaan.project.DomainOptions = .{
+            .host = host,
+            .port = optionValue(args, "--port") orelse "8080",
+            .caddyfile = optionValue(args, "--caddyfile"),
+            .ip = optionValue(args, "--ip"),
+            .reload = optionFlag(args, "--reload"),
+        };
+        const result = if (is_add)
+            yaan.project.domainAdd(init.io, allocator, domain_opts)
+        else
+            yaan.project.domainRemove(init.io, allocator, domain_opts);
+        result catch |err| switch (err) {
+            // Message already printed by the reload step; exit without a trace.
+            error.DeployFailed => std.process.exit(1),
+            else => return err,
+        };
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         const sub = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else "";
         if (std.mem.eql(u8, sub, "gcp") or std.mem.eql(u8, sub, "cloudrun")) {
@@ -293,7 +318,8 @@ fn usage() void {
         \\
         \\commands:
         \\  init [name]
-        \\  add <docker|systemd|cloudrun|tencent|alibaba|azure|workflow [all|cloudrun|azure|tencent|alibaba]>    (emit deployment files or GitHub Actions workflows)
+        \\  add <docker|systemd|caddy|cloudrun|tencent|alibaba|azure|workflow [all|cloudrun|azure|tencent|alibaba]>    (emit deployment files or GitHub Actions workflows)
+        \\  domain <add|rm> <host> [--port 8080] [--caddyfile PATH] [--ip ADDR] [--reload]   (attach a domain via Caddy reverse proxy + print the DNS record)
         \\  deploy gcp [--project ID] [--region R] [--service NAME] [--set-env-vars K=V,...] [--dry-run]
         \\  deploy tencent [--function NAME] [--region R] [--memory MB] [--set-env-vars K=V,...] [--dry-run]
         \\  deploy alibaba [--function NAME] [--region R] [--memory MB] [--oss-bucket NAME] [--set-env-vars K=V,...] [--dry-run]
